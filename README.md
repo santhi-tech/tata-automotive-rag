@@ -4,7 +4,7 @@
 
 A retrieval-augmented generation (RAG) platform that ingests automotive knowledge from heterogeneous sources (dynamic web pages, product images) into one canonical document model, indexes it in PostgreSQL + pgvector, and serves category-scoped, grounded answers through a local LLM (Ollama).
 
-**Author:** Santhi — AI Engineer | GenAI & RAG | DevOps
+**Author:** **Santhi Bhogavalli** — AI Engineer | GenAI & RAG | Senior DevOps
 
 ---
 
@@ -558,7 +558,3 @@ These three run **offline** — no PostgreSQL, Ollama, or network access needed.
 | Local LLM via Ollama, with a non-LLM fallback | Privacy, cost control, and the UI still returns something useful if Ollama times out | Answer quality and latency bounded by local hardware (vision captioning is markedly slower on CPU-only hosts) |
 
 ---
-
-## Author
-
-**Santhi Bhogavalli** AI Engineer | GenAI & RAG | Senior DevOps Engineer
