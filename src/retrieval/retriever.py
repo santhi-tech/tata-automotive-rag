@@ -5,10 +5,8 @@ import json
 import re
 import time
 from typing import Any, Callable, Sequence
-
 import asyncpg
 from requests import RequestException
-
 from config.logger import setup_logger
 from config.settings import DB_PARAMS, VECTOR_OPERATOR
 from ingestion.embedding.embedder import Embedder
@@ -136,10 +134,14 @@ def generate_answer(query: str, context: str) -> str:
     if not context.strip():
         return "I could not find indexed automotive information matching that question."
     prompt = (
-        "You are an automotive parts assistant. Answer only from the supplied context. "
-        "When the user requests products, include a concise Markdown table with part name, price, "
-        "and vehicle compatibility when those fields are present. Do not say the question is missing "
-        "when product context is supplied. If the context is incomplete, state exactly what is missing.\n\n"
+        "You are an expert automotive knowledge assistant specializing in cars, motorcycles, scooters, and spare parts. "
+        "Answer ONLY about the specific product(s) mentioned in the question. Ignore unrelated products in the context.\n"
+        "Rules:\n"
+        "1. Identify the main product(s) in the question (e.g., 'Altroz', 'Hero bike'). Answer ONLY about those.\n"
+        "2. If asked about colors/variants/specifications, extract and list them explicitly in a bullet list or table.\n"
+        "3. For product comparisons, show side-by-side specs in a Markdown table: Product | Price | Key Features | Colors.\n"
+        "4. If a field is missing (e.g., no colors indexed), state: 'Colors not indexed for this product'.\n"
+        "5. Be specific and avoid generic repeated data. Answer directly in 2–4 sentences + table/list.\n\n"
         f"Question: {query}\n\nContext:\n{context}\n\nAnswer:"
     )
     logger.info("Answer generation started | context_chars=%d", len(context))
@@ -230,7 +232,7 @@ async def search_in_category(
         rows = rrf_fusion(vector_rows, keyword_rows)
     else:
         rows = vector_rows
-    return unique_by(rows, product_identity, candidate_count)
+    return unique_by(rows, product_identity, top_k)
 
 
 async def retrieve_with_sources(
@@ -238,8 +240,19 @@ async def retrieve_with_sources(
 ) -> tuple[str, list[asyncpg.Record]]:
     started_at = time.monotonic()
     logger.info("Retrieval request started | query=%r | category=%s", query, category)
-    rows = await search_in_category(query, category, top_k)
-    unique_rows = unique_by(rows, product_identity, top_k)
+    rows = await search_in_category(query, category, top_k * 2)
+    unique_rows = unique_by(rows, product_identity, top_k * 2)
+
+    if len(unique_rows) > 1:
+        primary_product = product_identity(unique_rows[0])
+        same_product = [r for r in unique_rows if product_identity(r) == primary_product]
+        if len(same_product) >= top_k:
+            unique_rows = same_product[:top_k]
+            logger.info("Filtered to single product | product=%s | results=%d", primary_product, len(unique_rows))
+        else:
+            unique_rows = unique_rows[:top_k]
+    else:
+        unique_rows = unique_rows[:top_k]
 
     context = "\n\n".join(str(row["text"]) for row in unique_rows)
     answer = format_product_answer(unique_rows, as_table=wants_table(query))
