@@ -4,12 +4,8 @@
 
 A retrieval-augmented generation (RAG) platform that ingests automotive knowledge from heterogeneous sources (dynamic web pages, product images) into one canonical document model, indexes it in PostgreSQL + pgvector, and serves category-scoped, grounded answers through a local LLM (Ollama).
 
-<<<<<<< HEAD
-=======
-**Author:** **Santhi Bhogavalli** — AI Engineer | GenAI & RAG | Senior DevOps
 
->>>>>>> 31e580f47c4999ee4f595c90866dc4d62645874a
----
+**Author:** **Santhi Bhogavalli** — AI Engineer | GenAI & RAG | Senior DevOps
 
 ## Table of Contents
 
