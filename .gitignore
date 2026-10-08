@@ -9,3 +9,11 @@ data/*
 
 # Ignore specific log file
 output.log
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+#claude.md
+CLAUDE.md
+#Ignore .ruff_cache 
+.ruff_cache/*
