@@ -4,8 +4,6 @@
 
 A retrieval-augmented generation (RAG) platform that ingests automotive knowledge from heterogeneous sources (dynamic web pages, product images) into one canonical document model, indexes it in PostgreSQL + pgvector, and serves category-scoped, grounded answers through a local LLM (Ollama).
 
-**Author:** Santhi — AI Engineer | GenAI & RAG | DevOps
-
 ---
 
 ## Table of Contents
@@ -88,7 +86,7 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | HNSW vector indexes | ✅ Implemented | `MetadataStore._ensure_indexes`; falls back to exact scan on pgvector < 0.5 |
 | Containerized ingestion | ✅ Implemented | `Dockerfile` (Chromium + Playwright deps baked in) |
 | Query understanding beyond category keywords (intent, entities) | 🗺️ Planned | Category detection is keyword-based, not a classifier |
-| Keyword search (BM25) + score fusion (RRF) | 🗺️ Planned | Not currently implemented |
+| Keyword search (BM25) + score fusion (RRF) | ✅ Implemented | `search_keywords()` via PostgreSQL tsvector; fused with vector results via RRF in `search_in_category()` |
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
 | Scheduled / incremental re-ingestion | 🗺️ Planned | Ingestion is a manual `python -m ingestion.pipeline` run |
 | Evaluation harness (retrieval and answer quality) | 🗺️ Planned | `tests/evaluation.py` is a 2-case smoke script, not a harness |
@@ -343,8 +341,20 @@ search_in_category(query, selected_category, top_k)
   ├─ else: category words in the question?    → use those ("SUV" → cars, "brake parts" → spare_parts)
   └─ else: embed → fetch top-1 match anywhere → use THAT row's category
   │
-  ▼
-search_similar(embedding, categories, 4×top_k candidates)   — SQL: category = ANY($categories)
+  ├─ VECTOR PATH (parallel)                     │  KEYWORD PATH (parallel, text only)
+  │  search_similar(embedding, category,        │  search_keywords(query, category,
+  │    4×top_k candidates)                      │    4×top_k candidates)
+  │   — pgvector <-> or <=> LIMIT               │   — PostgreSQL tsvector @@
+  │   — cosine or L2 distance                   │     to_tsquery('english', ...)
+  │   — nearest neighbors                       │   — BM25-style full-text ranking
+  │                                             │
+  └─────────────────────┬──────────────────────┘
+                        │
+                        ▼
+                  rrf_fusion(vector, keyword)
+                   — Reciprocal Rank Fusion: score = 1/rank_v + 1/rank_k per chunk
+                   — de-duplicate by chunk_id, ranked by combined score
+                   — applies only when modality="text" and keyword results exist
   │
   ▼
 unique_by(product_identity)  — one row per distinct product, ranked, capped at top_k
@@ -354,9 +364,9 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
              └─ on timeout/error → fallback_answer(): formatted sources, never a hard failure
 ```
 
-**Why this never mixes categories:** the one path every call goes through — `search_in_category` — resolves to a single category list before any vector search runs, and `search_similar`'s `WHERE category = ANY(...)` enforces it in SQL. Asking "tell me about cars" with **All** selected returns only `cars` rows, even though motorcycles/scooters/spare_parts chunks sit in the same table.
+**Why this never mixes categories:** the one path every call goes through — `search_in_category` — resolves to a single category list before any search runs, and both `search_similar` and `search_keywords` enforce it via `WHERE category = ANY(...)` in SQL. Asking "tell me about cars" with **All** selected returns only `cars` rows, even though motorcycles/scooters/spare_parts chunks sit in the same table.
 
-Image search (`search_images_for_query`) goes through the identical `search_in_category` call with `modality="image"`.
+**BM25 and RRF:** The vector search (semantic similarity) is combined with keyword search (BM25-style term frequency) via Reciprocal Rank Fusion. Both paths run in parallel (35s total timeout for the embedding call covers both); the fused result balances semantic relevance (what the model thinks is conceptually similar) with lexical match (what literally contains the query terms). Image search (`search_images_for_query`) goes through the identical `search_in_category` call with `modality="image"`, which skips the keyword path since images have no text to match.
 
 ### Retrieval status
 
@@ -367,7 +377,7 @@ Image search (`search_images_for_query`) goes through the identical `search_in_c
 | Question-driven category keywords | ✅ Implemented (`CATEGORY_TERMS` in `retriever.py`) |
 | Structured product answers (no LLM round-trip) | ✅ Implemented |
 | Non-LLM fallback on Ollama timeout | ✅ Implemented |
-| BM25 / keyword search + RRF fusion | 🗺️ Planned |
+| BM25 / keyword search + RRF fusion | ✅ Implemented |
 | Cross-encoder reranking | 🗺️ Planned |
 | Entity/intent-level query understanding | 🗺️ Planned |
 

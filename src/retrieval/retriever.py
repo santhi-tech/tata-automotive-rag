@@ -12,12 +12,10 @@ from requests import RequestException
 from config.logger import setup_logger
 from config.settings import DB_PARAMS, VECTOR_OPERATOR
 from ingestion.embedding.embedder import Embedder
-from ingestion.metadata.metadata_store import to_pgvector
 
 logger = setup_logger(__name__)
 embedder = Embedder()
 
-# Words that pin a question to one catalogue category (whole-word match, lower case).
 CATEGORY_TERMS = {
     "cars": {"car", "cars", "suv", "suvs", "sedan", "sedans", "hatchback", "hatchbacks"},
     "motorcycles": {"motorcycle", "motorcycles", "motorbike", "motorbikes", "bike", "bikes"},
@@ -27,10 +25,9 @@ CATEGORY_TERMS = {
 
 
 def categories_in(query: str) -> list[str]:
-    """Categories named in the question. "brake parts for my car" means spare parts, not cars."""
+    """Categories named in the question."""
     words = set(re.findall(r"[a-z]+", query.lower()))
-    found = [category for category, terms in CATEGORY_TERMS.items() if words & terms]
-    # ponytail: keyword rules; swap for a classifier if questions get past simple category words.
+    found = [cat for cat, terms in CATEGORY_TERMS.items() if words & terms]
     return ["spare_parts"] if "spare_parts" in found else found
 
 
@@ -44,17 +41,16 @@ def get_embedding(text: str) -> list[float]:
 
 async def search_similar(
     query_embedding: Sequence[float],
-    category: str | Sequence[str] | None = None,
+    category: str | None = None,
     top_k: int = 5,
     modality: str = "text",
 ) -> list[asyncpg.Record]:
-    """Nearest rows, restricted to ``category`` (one name or several) when given."""
-    vector = to_pgvector(query_embedding)
-    if vector is None:
+    if not query_embedding:
         return []
     if modality not in {"text", "image"}:
         raise ValueError("modality must be 'text' or 'image'")
 
+    vector = "[" + ",".join(str(value) for value in query_embedding) + "]"
     limit = max(1, min(int(top_k), 50))
     if modality == "text":
         columns = "chunk_id, category, text, metadata"
@@ -69,10 +65,9 @@ async def search_similar(
 
     query = f"SELECT {columns} FROM {table}"
     parameters: list[Any] = [vector, limit]
-    categories = [category] if isinstance(category, str) else list(category or [])
-    if categories:
-        query += f" WHERE {category_column} = ANY($3::text[])"
-        parameters.append(categories)
+    if category:
+        query += f" WHERE {category_column} = $3"
+        parameters.append(category)
     query += f" ORDER BY {vector_column} {VECTOR_OPERATOR} $1::vector LIMIT $2"
 
     logger.info("Vector search started | modality=%s | category=%s | top_k=%d", modality, category, limit)
@@ -83,6 +78,58 @@ async def search_similar(
         return rows
     finally:
         await connection.close()
+
+
+async def search_keywords(
+    query: str, categories: list[str] | None = None, top_k: int = 5
+) -> list[asyncpg.Record]:
+    """Full-text search via PostgreSQL tsvector + ts_rank (BM25-style keyword ranking)."""
+    if not query or not query.strip():
+        return []
+    query_terms = " & ".join(query.lower().split()[:5])
+    limit = max(1, min(int(top_k), 50))
+    connection = await asyncpg.connect(timeout=10, command_timeout=20, **DB_PARAMS)
+    try:
+        category_filter = ""
+        params: list[Any] = [query_terms, limit]
+        if categories:
+            category_filter = " AND category = ANY($3::text[])"
+            params.append(categories)
+        sql = f"""
+            SELECT chunk_id, category, text, metadata,
+                   ts_rank(to_tsvector('english', text), to_tsquery('english', $1)) AS rank
+            FROM brochure_chunks
+            WHERE to_tsvector('english', text) @@ to_tsquery('english', $1) {category_filter}
+            ORDER BY rank DESC LIMIT $2
+        """
+        rows = list(await connection.fetch(sql, *params))
+        logger.info("Keyword search completed | results=%d", len(rows))
+        return rows
+    finally:
+        await connection.close()
+
+
+def rrf_fusion(vector_rows: Sequence[asyncpg.Record], keyword_rows: Sequence[asyncpg.Record]) -> list[asyncpg.Record]:
+    """Reciprocal Rank Fusion: combine vector + keyword results by chunk_id."""
+    scores: dict[str, tuple[float, asyncpg.Record]] = {}
+    for i, row in enumerate(vector_rows, start=1):
+        cid = str(row["chunk_id"])
+        score = scores.get(cid, (0.0, row))[0] + 1.0 / i
+        scores[cid] = (score, row)
+    for i, row in enumerate(keyword_rows, start=1):
+        cid = str(row["chunk_id"])
+        score = scores.get(cid, (0.0, row))[0] + 1.0 / i
+        scores[cid] = (score, row)
+    fused = sorted(scores.items(), key=lambda x: -x[1][0])
+    return [row for _, (_, row) in fused]
+
+
+def unique_by(rows: Sequence[asyncpg.Record], key: Callable[[Any], str], limit: int) -> list[asyncpg.Record]:
+    """First row per key, in rank order, at most ``limit`` rows."""
+    first: dict[str, asyncpg.Record] = {}
+    for row in rows:
+        first.setdefault(key(row), row)
+    return list(first.values())[:limit]
 
 
 def generate_answer(query: str, context: str) -> str:
@@ -117,14 +164,6 @@ def product_identity(row: asyncpg.Record) -> str:
         or metadata.get("document_id")
         or str(row["text"] or "").strip().lower()
     )
-
-
-def unique_by(rows: Sequence[asyncpg.Record], key: Callable[[Any], str], limit: int) -> list[asyncpg.Record]:
-    """First row per key, in rank order, at most ``limit`` rows."""
-    first: dict[str, asyncpg.Record] = {}
-    for row in rows:
-        first.setdefault(key(row), row)
-    return list(first.values())[:limit]
 
 
 def wants_table(query: str) -> bool:
@@ -170,15 +209,28 @@ def fallback_answer(query: str, rows: Sequence[asyncpg.Record]) -> str:
 async def search_in_category(
     query: str, category: str | None, top_k: int, modality: str = "text"
 ) -> list[asyncpg.Record]:
-    """Vector search that never mixes categories: the selected one, else the ones the question names,
-    else the category of the single best match. Fewer than ``top_k`` rows beats padding with other vehicles."""
+    """Vector + keyword hybrid search, category-scoped, fused with RRF."""
     query_embedding = await asyncio.wait_for(asyncio.to_thread(get_embedding, query), timeout=35)
     categories = [category] if category else categories_in(query)
     if not categories:
         best = await search_similar(query_embedding, top_k=1, modality=modality)
         categories = [best[0]["category"]] if best else []
     logger.info("Category scope | selected=%s | used=%s", category, categories)
-    return await search_similar(query_embedding, categories, min(max(int(top_k) * 4, int(top_k)), 50), modality)
+
+    candidate_count = min(max(int(top_k) * 4, int(top_k)), 50)
+    tasks = [search_similar(query_embedding, categories[0] if len(categories) == 1 else None, candidate_count, modality)]
+    if modality == "text":
+        tasks.append(search_keywords(query, categories, candidate_count))
+
+    results = await asyncio.gather(*tasks)
+    vector_rows = results[0]
+    keyword_rows = results[1] if len(results) > 1 else []
+
+    if modality == "text" and keyword_rows:
+        rows = rrf_fusion(vector_rows, keyword_rows)
+    else:
+        rows = vector_rows
+    return unique_by(rows, product_identity, candidate_count)
 
 
 async def retrieve_with_sources(
