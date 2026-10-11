@@ -12,7 +12,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.logger import setup_logger
-from retrieval.retriever import parse_metadata, retrieve_with_sources, search_images_for_query, wants_table
+from retrieval.retriever import SUPPORTED_LANGUAGES, parse_metadata, retrieve_with_sources, search_images_for_query, wants_table
 
 logger = setup_logger(__name__)
 
@@ -59,6 +59,7 @@ with st.sidebar:
     st.header("Search settings")
     modality = st.radio("Search type", ["Text", "Image"], horizontal=True)
     category = st.selectbox("Category", ["All", "cars", "motorcycles", "scooters", "spare_parts"])
+    language = st.selectbox("Response language", list(SUPPORTED_LANGUAGES))
     top_k = st.slider("Results", min_value=1, max_value=10, value=5)
 
 query = st.text_input("Ask about vehicles, features, parts, or specifications")
@@ -74,7 +75,7 @@ if search_clicked:
             with st.spinner("Searching the indexed knowledge base..."):
                 if modality == "Text":
                     answer, rows = asyncio.run(
-                        retrieve_with_sources(query, category=selected_category, top_k=top_k)
+                        retrieve_with_sources(query, category=selected_category, top_k=top_k, language=language)
                     )
                     st.subheader("Answer")
                     st.markdown(answer)
@@ -82,6 +83,14 @@ if search_clicked:
                     rows = asyncio.run(
                         search_images_for_query(query, category=selected_category, top_k=top_k)
                     )
+                    st.subheader("Images")
+                    cols = st.columns(min(len(rows), 3)) if rows else []
+                    for i, row in enumerate(rows):
+                        meta = parse_metadata(row_value(row, "metadata", {}))
+                        img = meta.get("local_path") or meta.get("image_url")
+                        if img:
+                            with cols[i % len(cols)]:
+                                st.image(img, caption=meta.get("part_name") or meta.get("model") or "")
             render_sources(rows, show_table=wants_table(query))
             logger.info("UI search completed | results=%d", len(rows))
         except TimeoutError:

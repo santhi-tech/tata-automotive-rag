@@ -61,10 +61,13 @@ class Embedder:
             raise RuntimeError(f"Unexpected embedding response: {data}")
         return data["embeddings"][0]
 
-    def generate_text(self, prompt: str, timeout: float = 120) -> str:
+    def generate_text(self, prompt: str, timeout: float = 120, model: str | None = None, max_tokens: int = 0) -> str:
         if not prompt or not prompt.strip():
             return ""
-        data = self._post("generate", {"model": self.gen_model, "prompt": prompt, "stream": False}, timeout)
+        payload: dict[str, Any] = {"model": model or self.gen_model, "prompt": prompt, "stream": False}
+        if max_tokens > 0:
+            payload["options"] = {"num_predict": max_tokens}
+        data = self._post("generate", payload, timeout)
         if data.get("response") is None:
             raise RuntimeError(f"Unexpected Ollama response: {data}")
         return data["response"]

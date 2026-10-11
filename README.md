@@ -80,6 +80,8 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | PostgreSQL + pgvector persistence | ✅ Implemented | `ingestion/metadata/metadata_store.py` |
 | Category-scoped retrieval | ✅ Implemented | `retrieval/retriever.py::search_in_category` — never mixes categories; see [Retrieval Architecture](#retrieval-architecture) |
 | Streamlit UI | ✅ Implemented | `serving/ui_streamlit.py` |
+| Multilingual response output (English, German, Hindi, Telugu) | ✅ Implemented | Language selector in sidebar; prompt-engineered via `qwen2.5:1.5b` (instruction-tuned) |
+| Image grid display | ✅ Implemented | Image search results displayed in a 3-column grid with product captions, before the expandable sources |
 | Grounded generation via Ollama, with a non-LLM fallback | ✅ Implemented | Falls back to a formatted product list if Ollama times out |
 | Metadata-aware filtering (brand / category / model) | ✅ Implemented | Category filter is a SQL `WHERE category = ANY(...)`; brand/model come back in each row's metadata |
 | Question-driven category detection ("All" categories selected) | ✅ Implemented | Keyword match (`CATEGORY_TERMS`), falling back to the top match's own category |
@@ -116,7 +118,7 @@ flowchart TB
     subgraph MODEL["Ollama (local)"]
         EMBED["nomic-embed-text\n(text + image-caption embeddings)"]
         VISION["llava\n(image captioning)"]
-        GEN["qwen2.5-coder / llama3.1\n(answer generation)"]
+        GEN["qwen2.5:1.5b\n(answer generation, multilingual)"]
     end
 
     subgraph DB["PostgreSQL + pgvector"]
@@ -155,7 +157,7 @@ Run on demand via `python -m ingestion.pipeline`. It is I/O-heavy (Playwright, i
 ### Online / Serving Plane
 
 ```
-Streamlit  →  retriever.search_in_category()  →  pgvector nearest-neighbour  →  Ollama (or fallback)  →  Answer + sources
+Streamlit  →  retriever.search_in_category()  →  pgvector nearest-neighbour  →  Ollama (or fallback)  →  Answer (multilingual) + sources
 ```
 
 Runs per request and is latency-sensitive: each text query makes at most one Ollama embedding call and one Ollama generation call (35s timeout each).
@@ -271,7 +273,7 @@ Text and image embeddings therefore live in the **same embedding space** (both a
 | **aiohttp** | Async image downloads |
 | **Pillow** | Re-encodes images to JPEG before sending to Ollama's vision model |
 | **pytesseract** | Installed; not currently wired into the normalized document (no `ocr_text` producer in the loaders) |
-| **Ollama** (`llava` for vision, `nomic-embed-text` for embeddings, `qwen2.5-coder`/`llama3.1` for generation) | All three model roles, served locally |
+| **Ollama** (`llava` for vision, `nomic-embed-text` for embeddings, `qwen2.5:1.5b` for multilingual generation) | All three model roles, served locally |
 
 ---
 
@@ -360,9 +362,9 @@ search_in_category(query, selected_category, top_k)
   ▼
 unique_by(product_identity)  — one row per distinct product, ranked, capped at top_k
   │
-  ├─ table/list requested, or structured fields present → format_product_answer() (no LLM call)
-  └─ else → generate_answer() via Ollama, 35s timeout
-             └─ on timeout/error → fallback_answer(): formatted sources, never a hard failure
+  ├─ English + structured fields present → format_product_answer() (no LLM call)
+  └─ else → generate_answer() via Ollama, 60s timeout (multilingual prompt: language instruction at start + end)
+             └─ on timeout/error → fallback_answer(): formatted sources (English), never a hard failure
 ```
 
 **Why this never mixes categories:** the one path every call goes through — `search_in_category` — resolves to a single category list before any search runs, and both `search_similar` and `search_keywords` enforce it via `WHERE category = ANY(...)` in SQL. Asking "tell me about cars" with **All** selected returns only `cars` rows, even though motorcycles/scooters/spare_parts chunks sit in the same table.
@@ -392,7 +394,7 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
 | Web acquisition | Playwright (Chromium), aiohttp |
 | Image processing | Pillow |
 | Storage | PostgreSQL + pgvector (HNSW) |
-| LLM serving | Ollama — `nomic-embed-text` (embeddings), `llava` (vision), `qwen2.5-coder`/`llama3.1` (generation) |
+| LLM serving | Ollama — `nomic-embed-text` (embeddings), `llava` (vision), `qwen2.5:1.5b` (multilingual generation) |
 | UI | Streamlit |
 | Containerization | Docker (ingestion image, Playwright/Chromium preinstalled) |
 | Testing | pytest + pytest-asyncio |
@@ -405,7 +407,7 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
 
 - Python 3.12+ and [`uv`](https://docs.astral.sh/uv/)
 - PostgreSQL with the `pgvector` extension installed (or superuser access to run `CREATE EXTENSION vector`)
-- [Ollama](https://ollama.com/) running locally, with these models pulled: `nomic-embed-text`, `llava`, and a generation model (e.g. `qwen2.5-coder` or `llama3.1:8b`)
+- [Ollama](https://ollama.com/) running locally, with these models pulled: `nomic-embed-text`, `llava`, and `qwen2.5:1.5b` (instruction-tuned, supports multilingual output)
 
 ### Setup
 
@@ -415,7 +417,7 @@ cd tata-automotive-rag
 
 uv sync                    # installs dependencies incl. streamlit, pytest
 uv run playwright install chromium
-ollama pull nomic-embed-text llava qwen2.5-coder
+ollama pull nomic-embed-text llava qwen2.5:1.5b
 ```
 
 ### Configure
@@ -546,7 +548,7 @@ These three run **offline** — no PostgreSQL, Ollama, or network access needed.
 - Scheduled / incremental re-ingestion with change detection
 
 **Retrieval quality**
-- BM25 keyword search with RRF fusion alongside vector search
+- ~~BM25 keyword search with RRF fusion alongside vector search~~ ✅ Done
 - Cross-encoder reranking
 - A real retrieval/answer-quality evaluation harness (beyond the 2-case smoke script)
 
@@ -567,5 +569,6 @@ These three run **offline** — no PostgreSQL, Ollama, or network access needed.
 | Category resolved before vector search, in SQL | Guarantees no cross-category leakage, even under "All" | Needs either a selected category, a recognized keyword, or a decent top-1 match; an ambiguous all-categories question still picks one category from the best hit |
 | PostgreSQL + pgvector, single store | One system for metadata and vectors; SQL `WHERE` + vector search in one query | A dedicated vector DB may out-scale this at very large catalogue sizes |
 | Local LLM via Ollama, with a non-LLM fallback | Privacy, cost control, and the UI still returns something useful if Ollama times out | Answer quality and latency bounded by local hardware (vision captioning is markedly slower on CPU-only hosts) |
+| Multilingual via prompt engineering, not a translation API | Zero extra dependencies or API costs; the instruction-tuned `qwen2.5:1.5b` follows language instructions natively | Quality depends on the model's training data for each language; falls back to English if generation fails |
 
 ---

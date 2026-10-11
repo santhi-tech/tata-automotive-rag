@@ -130,10 +130,15 @@ def unique_by(rows: Sequence[asyncpg.Record], key: Callable[[Any], str], limit: 
     return list(first.values())[:limit]
 
 
-def generate_answer(query: str, context: str) -> str:
+SUPPORTED_LANGUAGES = {"English": "", "German": "German", "Hindi": "Hindi", "Telugu": "Telugu"}
+
+
+def generate_answer(query: str, context: str, language: str = "English") -> str:
     if not context.strip():
         return "I could not find indexed automotive information matching that question."
+    lang_line = f"You MUST respond entirely in {SUPPORTED_LANGUAGES[language]}. " if language != "English" else ""
     prompt = (
+        f"{lang_line}"
         "You are an expert automotive knowledge assistant specializing in cars, motorcycles, scooters, and spare parts. "
         "Answer ONLY about the specific product(s) mentioned in the question. Ignore unrelated products in the context.\n"
         "Rules:\n"
@@ -142,10 +147,12 @@ def generate_answer(query: str, context: str) -> str:
         "3. For product comparisons, show side-by-side specs in a Markdown table: Product | Price | Key Features | Colors.\n"
         "4. If a field is missing (e.g., no colors indexed), state: 'Colors not indexed for this product'.\n"
         "5. Be specific and avoid generic repeated data. Answer directly in 2–4 sentences + table/list.\n\n"
-        f"Question: {query}\n\nContext:\n{context}\n\nAnswer:"
+        f"Question: {query}\n\nContext:\n{context}\n\n"
+        f"{'Respond entirely in ' + SUPPORTED_LANGUAGES[language] + '.\\n' if language != 'English' else ''}"
+        "Answer:"
     )
-    logger.info("Answer generation started | context_chars=%d", len(context))
-    return embedder.generate_text(prompt, timeout=30)
+    logger.info("Answer generation started | language=%s | model=%s | context_chars=%d", language, embedder.gen_model, len(context))
+    return embedder.generate_text(prompt, timeout=60, max_tokens=300)
 
 
 def parse_metadata(value: Any) -> dict[str, Any]:
@@ -236,7 +243,7 @@ async def search_in_category(
 
 
 async def retrieve_with_sources(
-    query: str, category: str | None = None, top_k: int = 5
+    query: str, category: str | None = None, top_k: int = 5, language: str = "English"
 ) -> tuple[str, list[asyncpg.Record]]:
     started_at = time.monotonic()
     logger.info("Retrieval request started | query=%r | category=%s", query, category)
@@ -255,13 +262,18 @@ async def retrieve_with_sources(
         unique_rows = unique_rows[:top_k]
 
     context = "\n\n".join(str(row["text"]) for row in unique_rows)
-    answer = format_product_answer(unique_rows, as_table=wants_table(query))
+    if language == "English":
+        answer = format_product_answer(unique_rows, as_table=wants_table(query))
+    else:
+        answer = None
     if answer is None:
         try:
-            answer = await asyncio.wait_for(asyncio.to_thread(generate_answer, query, context), timeout=35)
+            answer = await asyncio.wait_for(asyncio.to_thread(generate_answer, query, context, language), timeout=65)
         except (RequestException, TimeoutError, asyncio.TimeoutError):
-            logger.warning("Answer generation timed out; returning retrieved sources")
+            logger.warning("Answer generation failed | language=%s", language)
             answer = fallback_answer(query, unique_rows)
+            if language != "English":
+                answer = f"⚠ Generation in {language} failed (model timeout). Showing English fallback.\n\n{answer}"
     logger.info("Retrieval request completed | sources=%d | duration=%.2fs", len(unique_rows), time.monotonic() - started_at)
     return answer, unique_rows
 
@@ -273,6 +285,6 @@ async def search_images_for_query(
     return unique_by(rows, lambda row: str(row["chunk_id"]), top_k)
 
 
-async def retrieve_pipeline(query: str, category: str | None = None, top_k: int = 5) -> str:
-    answer, _rows = await retrieve_with_sources(query, category=category, top_k=top_k)
+async def retrieve_pipeline(query: str, category: str | None = None, top_k: int = 5, language: str = "English") -> str:
+    answer, _rows = await retrieve_with_sources(query, category=category, top_k=top_k, language=language)
     return answer
