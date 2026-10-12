@@ -117,8 +117,6 @@ class MetadataStore:
     async def _ensure_indexes(conn: asyncpg.Connection) -> None:
         await conn.execute("CREATE INDEX IF NOT EXISTS brochure_chunks_category_idx ON brochure_chunks (category);")
         await conn.execute("CREATE INDEX IF NOT EXISTS brochure_images_chunk_idx ON brochure_images (chunk_id);")
-        # Legacy IVFFlat(lists=100) indexes were built on an EMPTY table: very low recall, and ANN-then-filter can
-        # return fewer than LIMIT rows with a category filter.
         await conn.execute("DROP INDEX IF EXISTS brochure_chunks_text_embedding_idx;")
         await conn.execute("DROP INDEX IF EXISTS brochure_images_embedding_idx;")
         try:
@@ -129,10 +127,47 @@ class MetadataStore:
         except asyncpg.PostgresError as exc:  # pgvector < 0.5: exact scans are still correct at this scale
             logger.warning("HNSW unavailable (%s); using exact scans", exc)
  
-    async def reset(self) -> None:
+    async def _current_version(self) -> tuple[int, int]:
+        """Parse the highest metadata_version — checks chunks first, falls back to ingestion_meta table."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ingestion_meta (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                )
+            """)
+            raw = await conn.fetchval("SELECT MAX(metadata->>'metadata_version') FROM brochure_chunks")
+            if not raw:
+                raw = await conn.fetchval("SELECT value FROM ingestion_meta WHERE key = 'metadata_version'")
+        if not raw:
+            return (0, 0)
+        parts = raw.replace("v", "").split(".")
+        major = int(parts[0]) if parts[0].isdigit() else 0
+        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        return (major, minor)
+
+    async def next_metadata_version(self, *, reset: bool = False) -> str:
+        """reset=True → major+1.0 (e.g. v3.0→v4.0), reset=False → major.minor+1 (e.g. v3.0→v3.1)."""
+        major, minor = await self._current_version()
+        if reset or major == 0:
+            return f"v{major + 1}.0"
+        return f"v{major}.{minor + 1}"
+
+    async def _save_version(self, version: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO ingestion_meta (key, value) VALUES ('metadata_version', $1)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, version)
+
+    async def reset(self) -> str:
+        """Read version BEFORE truncating, then bump major."""
+        major, _ = await self._current_version()
+        version = f"v{major + 1}.0"
+        await self._save_version(version)
         async with self.pool.acquire() as conn:
             await conn.execute("TRUNCATE brochure_images, brochure_chunks;")
-        logger.warning("Knowledge base truncated (reset requested)")
+        logger.warning("Knowledge base truncated (reset requested) | next_version=%s", version)
+        return version
  
     # -- writing ----------------------------------------------------------------------------------
     async def upsert_documents(self, docs: list[NormalizedDocument], run_id: str) -> tuple[int, int]:

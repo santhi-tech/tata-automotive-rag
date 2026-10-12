@@ -37,11 +37,20 @@ def get_embedding(text: str) -> list[float]:
     return embedder.embed_text(text.strip(), timeout=30)
 
 
+async def _latest_metadata_version() -> str | None:
+    connection = await asyncpg.connect(timeout=10, command_timeout=10, **DB_PARAMS)
+    try:
+        return await connection.fetchval("SELECT MAX(metadata_version) FROM brochure_chunks")
+    finally:
+        await connection.close()
+
+
 async def search_similar(
     query_embedding: Sequence[float],
     category: str | None = None,
     top_k: int = 5,
     modality: str = "text",
+    metadata_version: str | None = None,
 ) -> list[asyncpg.Record]:
     if not query_embedding:
         return []
@@ -61,14 +70,21 @@ async def search_similar(
         vector_column = "i.image_embedding"
         category_column = "c.category"
 
-    query = f"SELECT {columns} FROM {table}"
+    conditions: list[str] = []
     parameters: list[Any] = [vector, limit]
+    idx = 3
     if category:
-        query += f" WHERE {category_column} = $3"
+        conditions.append(f"{category_column} = ${idx}")
         parameters.append(category)
-    query += f" ORDER BY {vector_column} {VECTOR_OPERATOR} $1::vector LIMIT $2"
+        idx += 1
+    if metadata_version:
+        conditions.append(f"{'c.' if modality != 'text' else ''}metadata_version = ${idx}")
+        parameters.append(metadata_version)
+        idx += 1
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    query = f"SELECT {columns} FROM {table}{where} ORDER BY {vector_column} {VECTOR_OPERATOR} $1::vector LIMIT $2"
 
-    logger.info("Vector search started | modality=%s | category=%s | top_k=%d", modality, category, limit)
+    logger.info("Vector search started | modality=%s | category=%s | version=%s | top_k=%d", modality, category, metadata_version, limit)
     connection = await asyncpg.connect(timeout=10, command_timeout=20, **DB_PARAMS)
     try:
         rows = list(await connection.fetch(query, *parameters))
@@ -79,7 +95,8 @@ async def search_similar(
 
 
 async def search_keywords(
-    query: str, categories: list[str] | None = None, top_k: int = 5
+    query: str, categories: list[str] | None = None, top_k: int = 5,
+    metadata_version: str | None = None,
 ) -> list[asyncpg.Record]:
     """Full-text search via PostgreSQL tsvector + ts_rank (BM25-style keyword ranking)."""
     if not query or not query.strip():
@@ -88,16 +105,22 @@ async def search_keywords(
     limit = max(1, min(int(top_k), 50))
     connection = await asyncpg.connect(timeout=10, command_timeout=20, **DB_PARAMS)
     try:
-        category_filter = ""
+        extra = ""
         params: list[Any] = [query_terms, limit]
+        idx = 3
         if categories:
-            category_filter = " AND category = ANY($3::text[])"
+            extra += f" AND category = ANY(${idx}::text[])"
             params.append(categories)
+            idx += 1
+        if metadata_version:
+            extra += f" AND metadata_version = ${idx}"
+            params.append(metadata_version)
+            idx += 1
         sql = f"""
             SELECT chunk_id, category, text, metadata,
                    ts_rank(to_tsvector('english', text), to_tsquery('english', $1)) AS rank
             FROM brochure_chunks
-            WHERE to_tsvector('english', text) @@ to_tsquery('english', $1) {category_filter}
+            WHERE to_tsvector('english', text) @@ to_tsquery('english', $1){extra}
             ORDER BY rank DESC LIMIT $2
         """
         rows = list(await connection.fetch(sql, *params))
@@ -215,10 +238,32 @@ def fallback_answer(query: str, rows: Sequence[asyncpg.Record]) -> str:
     return "The local answer model timed out. Retrieved source excerpts:\n\n" + "\n\n".join(excerpts)
 
 
+def _has_useful_metadata(row: asyncpg.Record) -> bool:
+    meta = parse_metadata(row.get("metadata", {}))
+    return bool(meta.get("model") or meta.get("part_name") or meta.get("brand"))
+
+
+async def _search_with_version(
+    query_embedding: Sequence[float], query: str, categories: list[str],
+    candidate_count: int, modality: str, metadata_version: str | None,
+) -> list[asyncpg.Record]:
+    cat = categories[0] if len(categories) == 1 else None
+    tasks = [search_similar(query_embedding, cat, candidate_count, modality, metadata_version)]
+    if modality == "text":
+        tasks.append(search_keywords(query, categories, candidate_count, metadata_version))
+    results = await asyncio.gather(*tasks)
+    vector_rows = results[0]
+    keyword_rows = results[1] if len(results) > 1 else []
+    if modality == "text" and keyword_rows:
+        return rrf_fusion(vector_rows, keyword_rows)
+    return list(vector_rows)
+
+
 async def search_in_category(
     query: str, category: str | None, top_k: int, modality: str = "text"
 ) -> list[asyncpg.Record]:
-    """Vector + keyword hybrid search, category-scoped, fused with RRF."""
+    """Vector + keyword hybrid search, category-scoped, fused with RRF.
+    Prefers latest metadata_version; falls back to any version if no results."""
     query_embedding = await asyncio.wait_for(asyncio.to_thread(get_embedding, query), timeout=35)
     categories = [category] if category else categories_in(query)
     if not categories:
@@ -227,19 +272,15 @@ async def search_in_category(
     logger.info("Category scope | selected=%s | used=%s", category, categories)
 
     candidate_count = min(max(int(top_k) * 4, int(top_k)), 50)
-    tasks = [search_similar(query_embedding, categories[0] if len(categories) == 1 else None, candidate_count, modality)]
-    if modality == "text":
-        tasks.append(search_keywords(query, categories, candidate_count))
-
-    results = await asyncio.gather(*tasks)
-    vector_rows = results[0]
-    keyword_rows = results[1] if len(results) > 1 else []
-
-    if modality == "text" and keyword_rows:
-        rows = rrf_fusion(vector_rows, keyword_rows)
-    else:
-        rows = vector_rows
-    return unique_by(rows, product_identity, top_k)
+    latest_version = await _latest_metadata_version()
+    rows = await _search_with_version(query_embedding, query, categories, candidate_count, modality, latest_version)
+    useful = [r for r in rows if _has_useful_metadata(r)]
+    if not useful and latest_version:
+        logger.info("No results for version=%s, falling back to any version", latest_version)
+        rows = await _search_with_version(query_embedding, query, categories, candidate_count, modality, None)
+        useful = [r for r in rows if _has_useful_metadata(r)]
+    # ponytail: if even fallback has no useful metadata, return raw rows rather than nothing
+    return unique_by(useful or rows, product_identity, top_k)
 
 
 async def retrieve_with_sources(

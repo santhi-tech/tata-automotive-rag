@@ -30,7 +30,12 @@ from ingestion.normalization.attributes import (
 
 logger = setup_logger(__name__)
 
-METADATA_VERSION = "2.0"
+METADATA_VERSION = "v2.0"
+
+
+def set_metadata_version(version: str) -> None:
+    global METADATA_VERSION
+    METADATA_VERSION = version
 _SOURCE_TYPE = {"cars": "pdf_brochure", "motorcycles": "web_product_page", "scooters": "web_product_page", "spare_parts": "spare_part"}
 
 
@@ -155,8 +160,10 @@ def normalize_document(raw: dict[str, Any], category: str, store: PersistentImag
     images = _normalize_images(raw, store)
 
     reserved = {"brand", "model", "part_name", "price", "description", "features", "color_variants",
-                "product_url", "source_url", "source_type", "category", "images"}
-    extra = {k: v for k, v in meta.items() if k not in reserved and v not in (None, "", [], {})}
+                "product_url", "source_url", "source_type", "category", "images",
+                "text", "text_embedding", "id", "document_id", "metadata", "run_id"}
+    combined: dict[str, Any] = {**raw, **meta}
+    extra = {k: v for k, v in combined.items() if k not in reserved and v not in (None, "", [], {}) and not isinstance(v, (list, dict, bytes))}
 
     return NormalizedDocument(
         # Spare parts (sha256) and cars (file stem) already emit stable ids; motorcycles/scooters emit none.
