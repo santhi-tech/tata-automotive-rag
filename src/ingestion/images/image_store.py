@@ -5,10 +5,30 @@ import os
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse
+from config.settings import IMAGE_DATA_DIR
 
+_ALLOWED_SUFFIXES = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
+MIN_IMAGE_BYTES = 200
+MIN_IMAGE_SIDE = 32
 class InvalidImageError(ValueError):
     """The file exists but is not a usable image (HTML error page, truncated, 1x1 tracker...)."""
 
+
+def validate_image_file(path: str | Path) -> None:
+    """Raise ``FileNotFoundError`` / ``InvalidImageError`` unless ``path`` is a decodable, non-trivial image."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Image not found: {p}")
+    if p.stat().st_size < MIN_IMAGE_BYTES:
+        raise InvalidImageError(f"Image too small to be real ({p.stat().st_size} bytes): {p}")
+    try:
+        with Image.open(p) as image:
+            width, height = image.size
+            image.verify()
+    except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise InvalidImageError(f"Not a decodable image: {p} ({exc})") from exc
+    if min(width, height) < MIN_IMAGE_SIDE:
+        raise InvalidImageError(f"Image is {width}x{height}, likely a tracking pixel: {p}")
 
 class PersistentImageStore:
     """Owns durable image files for one ingestion category."""
@@ -21,7 +41,7 @@ class PersistentImageStore:
         if not normalized_category:
             raise ValueError("Image category must not be empty")
         repository_root = Path(__file__).resolve().parents[3]
-        self.root = (Path(root) if root is not None else repository_root / "data").resolve()
+        self.root = Path(root) if root is not None else repository_root / "data"
         self.category = normalized_category
         self.directory = self.root / self.category / "images"
         self.directory.mkdir(parents=True, exist_ok=True)

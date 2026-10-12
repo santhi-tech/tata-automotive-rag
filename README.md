@@ -25,10 +25,11 @@ A retrieval-augmented generation (RAG) platform that ingests automotive knowledg
 14. [Getting Started](#getting-started)
 15. [Configuration Reference](#configuration-reference)
 16. [Example Prompts](#example-prompts)
-17. [Running Tests](#running-tests)
-18. [Roadmap](#roadmap)
-19. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
-20. [Author](#author)
+17. [REST API](#rest-api)
+18. [Running Tests](#running-tests)
+19. [Roadmap](#roadmap)
+20. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
+21. [Author](#author)
 
 ---
 
@@ -79,9 +80,10 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Chunking | ✅ Implemented | One product → one chunk (`MetadataStore.upsert_documents`) |
 | PostgreSQL + pgvector persistence | ✅ Implemented | `ingestion/metadata/metadata_store.py` |
 | Category-scoped retrieval | ✅ Implemented | `retrieval/retriever.py::search_in_category` — never mixes categories; see [Retrieval Architecture](#retrieval-architecture) |
-| Streamlit UI | ✅ Implemented | `serving/ui_streamlit.py` |
-| Multilingual response output (English, German, Hindi, Telugu) | ✅ Implemented | Language selector in sidebar; prompt-engineered via `qwen2.5:1.5b` (instruction-tuned) |
+| Streamlit UI | ✅ Implemented | `app/ui_streamlit.py` |
+| Multilingual response output: English, Deutsch (German), हिन्दी (Hindi), తెలుగు (Telugu) | ✅ Implemented | Language selector in sidebar; prompt-engineered via `qwen2.5:1.5b` (instruction-tuned) |
 | Image grid display | ✅ Implemented | Image search results displayed in a 3-column grid with product captions, before the expandable sources |
+| REST API with JWT auth | ✅ Implemented | `api/v1/deps.py` | `api/v1/routes.py` | `api/v1/auth.py` |`api/v1`; signup/login, per-category and search endpoints, Swagger docs at `/docs` |
 | Grounded generation via Ollama, with a non-LLM fallback | ✅ Implemented | Falls back to a formatted product list if Ollama times out |
 | Metadata-aware filtering (brand / category / model) | ✅ Implemented | Category filter is a SQL `WHERE category = ANY(...)`; brand/model come back in each row's metadata |
 | Question-driven category detection ("All" categories selected) | ✅ Implemented | Keyword match (`CATEGORY_TERMS`), falling back to the top match's own category |
@@ -104,8 +106,8 @@ flowchart TB
 
     USER["User"]
 
-    subgraph APP["Serving (Online)"]
-        UI["Streamlit UI\nserving/ui_streamlit.py"]
+    subgraph APP["app (Online)"]
+        UI["Streamlit UI\napp/ui_streamlit.py"]
         RETRIEVER["retrieval/retriever.py"]
     end
 
@@ -144,7 +146,7 @@ flowchart TB
 
 ## Offline vs. Online Architecture
 
-The system separates the **data plane** (ingestion) from the **serving plane** (query answering); they share only the database.
+The system separates the **data plane** (ingestion) from the **app plane** (query answering); they share only the database.
 
 ### Offline / Data Plane
 
@@ -154,7 +156,7 @@ CategoryLoader.download_and_extract()  →  normalize_document()  →  Embedder 
 
 Run on demand via `python -m ingestion.pipeline`. It is I/O-heavy (Playwright, image downloads) and compute-heavy (vision captioning on Ollama).
 
-### Online / Serving Plane
+### Online / app Plane
 
 ```
 Streamlit  →  retriever.search_in_category()  →  pgvector nearest-neighbour  →  Ollama (or fallback)  →  Answer (multilingual) + sources
@@ -165,7 +167,7 @@ Runs per request and is latency-sensitive: each text query makes at most one Oll
 ### Why they are decoupled
 
 - **Latency isolation:** scraping and vision captioning take seconds to minutes per product; none of that sits in the Streamlit request path.
-- **Independent failure domains:** a blocked loader or a slow website doesn't affect answer serving.
+- **Independent failure domains:** a blocked loader or a slow website doesn't affect answer app.
 - **Reproducibility:** `brochure_chunks`/`brochure_images` are the contract between the two planes — the knowledge store can be rebuilt (`--reset`) without touching retrieval code.
 
 ---
@@ -198,7 +200,9 @@ tata-automotive-rag/
 │   │   │   └── document_normalizer.py# normalize_document() -> NormalizedDocument
 │   │   └── metadata/metadata_store.py# MetadataStore: schema, upsert, pgvector literal encoding
 │   ├── retrieval/retriever.py        # search_in_category, retrieve_with_sources, search_images_for_query
-│   └── serving/ui_streamlit.py       # the Streamlit front end
+│   └── app/
+│       ├── ui_streamlit.py           # Streamlit front end (multilingual, image grid)
+│       └── api.py                    # FastAPI REST API with JWT auth
 ├── data/                             # persisted images, one subfolder per category (gitignored)
 └── tests/
     ├── test_cars_urls.py             # URL scoring + per-model image filter (offline)
@@ -394,7 +398,7 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
 | Web acquisition | Playwright (Chromium), aiohttp |
 | Image processing | Pillow |
 | Storage | PostgreSQL + pgvector (HNSW) |
-| LLM serving | Ollama — `nomic-embed-text` (embeddings), `llava` (vision), `qwen2.5:1.5b` (multilingual generation) |
+| LLM app | Ollama — `nomic-embed-text` (embeddings), `llava` (vision), `qwen2.5:1.5b` (multilingual generation) |
 | UI | Streamlit |
 | Containerization | Docker (ingestion image, Playwright/Chromium preinstalled) |
 | Testing | pytest + pytest-asyncio |
@@ -440,7 +444,7 @@ python -m ingestion.pipeline --reset                       # wipe and rebuild ev
 ```bash
 python main.py
 # or directly:
-cd src && streamlit run serving/ui_streamlit.py
+cd src && streamlit run app/ui_streamlit.py
 ```
 
 ### Docker (ingestion only)
@@ -530,6 +534,66 @@ print(answer)
 
 ---
 
+## REST API
+
+A FastAPI-based REST API with JWT authentication. Interactive docs at `http://localhost:8000/docs` (Swagger UI).
+
+### Run the API
+
+```bash
+cd src
+python -m uvicorn app.api:app --host 0.0.0.0 --port 8000
+```
+
+### Authentication
+
+All product endpoints require a JWT bearer token. Sign up, then use the token in the `Authorization` header.
+
+```bash
+# Signup (returns a JWT token)
+curl -X POST http://localhost:8000/api/signup \
+  -H "Content-Type: application/json" \
+  -d '{"username":"myuser","password":"mypassword"}'
+
+# Login (returns a fresh token)
+curl -X POST http://localhost:8000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"myuser","password":"mypassword"}'
+```
+
+### Endpoints
+
+All product endpoints accept `limit` (1–100, default 20) and `offset` (default 0) query params for pagination.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/signup` | Create account, returns JWT |
+| `POST` | `/api/login` | Authenticate, returns JWT |
+| `GET` | `/api/cars` | List cars with available metadata |
+| `GET` | `/api/motorcycles` | List motorcycles |
+| `GET` | `/api/scooters` | List scooters |
+| `GET` | `/api/spare-parts` | List spare parts with price, brand, vehicle type |
+| `GET` | `/api/products?category=cars` | Unified endpoint (same as above, category as param) |
+| `GET` | `/api/search?q=brake` | Full-text search across all categories (optional `category` filter) |
+
+### Example
+
+```bash
+TOKEN="<your-jwt-token>"
+
+# Get spare parts
+curl http://localhost:8000/api/spare-parts?limit=5 \
+  -H "Authorization: Bearer $TOKEN"
+
+# Search for brake-related products
+curl "http://localhost:8000/api/search?q=brake&category=spare_parts" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+User accounts are stored in PostgreSQL (`api_users` table, created automatically on startup). Passwords are bcrypt-hashed. Tokens expire after 24 hours.
+
+---
+
 ## Running Tests
 
 ```bash
@@ -554,7 +618,7 @@ These three run **offline** — no PostgreSQL, Ollama, or network access needed.
 
 **Platform**
 - CI/CD pipeline
-- Containerize the Streamlit serving side (ingestion already has a `Dockerfile`)
+- Containerize the Streamlit app side (ingestion already has a `Dockerfile`)
 - Observability: structured metrics on top of the existing logging
 
 ---
