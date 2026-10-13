@@ -90,7 +90,7 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Image vector search at query time | ✅ Implemented | `search_images_for_query`, same category scoping as text |
 | HNSW vector indexes | ✅ Implemented | `MetadataStore._ensure_indexes`; falls back to exact scan on pgvector < 0.5 |
 | Containerized ingestion | ✅ Implemented | `Dockerfile` (Chromium + Playwright deps baked in) |
-| Query understanding beyond category keywords (intent, entities) | 🗺️ Planned | Category detection is keyword-based, not a classifier |
+| Query understanding: intent and product entities | ✅ Implemented | `retriever.py::understand_query` labels intents (comparison, price, table, colour, spec, general) and matches product names against retrieved rows; rule-based, not an LLM classifier |
 | Keyword search (BM25) + score fusion (RRF) | ✅ Implemented | `search_keywords()` via PostgreSQL tsvector; fused with vector results via RRF in `search_in_category()` |
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
 | Scheduled / incremental re-ingestion | 🗺️ Planned | Ingestion is a manual `python -m ingestion.pipeline` run |
@@ -386,7 +386,7 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
 | Non-LLM fallback on Ollama timeout | ✅ Implemented |
 | BM25 / keyword search + RRF fusion | ✅ Implemented |
 | Cross-encoder reranking | 🗺️ Planned |
-| Entity/intent-level query understanding | 🗺️ Planned |
+| Entity/intent-level query understanding (rule-based) | ✅ Implemented |
 
 ---
 
@@ -494,25 +494,33 @@ CARS_ENABLE_VISION=false CARS_MAX_PRODUCTS=3 python -m ingestion.pipeline --cate
 
 These are example questions for the **Streamlit UI** (`search_in_category` resolves the category automatically even with **Category = All** selected).
 
+### What is loaded
+
+Counts from the `brochure_chunks` table, metadata about the products, and the `brochure` table.
+
+
+| Category | Loaded products | Notes |
+|---|---|---|
+| cars | Altroz, Curvv Series X, Harrier, New Tata Aeris, Nexon | `CARS_MAX_PRODUCTS=5` in `.env`; Punch is not loaded |
+| motorcycles | Glamour X, Glamour X ABS, Destini 110, Destini Prime, plus the Hero home page | No model name in metadata; name only appears in the page URL |
+| scooters | Destini 110, Destini Prime, Glamour X, Glamour X ABS, plus the Hero home page | Same Hero pages as motorcycles; the category split is not yet reliable |
+| spare_parts | Kicklever Assembly (Splendor+), Accelerator Cable (Passion X PRO), Cam Chain Tensioner Arm, Kit Ring Piston, Stay Screen (Xoom 160) | `SPARE_PARTS_MAX_PRODUCTS=5` |
+
 **Cars**
-- `Tell me about the Nexon EV`
-- `Compare the Altroz and the Punch`
-- `What SUVs does Tata sell with a sunroof?`
-- `Show Tata cars under 10 lakh as a table`
+- `Tell me about the Nexon`
+- `How many colours does the Altroz come in?`
+- `Show the Harrier and the Nexon as a table with price`
+- `Compare the Altroz and the Punch` — answers with the Altroz only and states `**Punch**: not in the indexed catalog.` (Punch is not loaded, so it is never described from general knowledge)
+- `Compare features of Altroz, Curvv Series X` — side-by-side table built from indexed metadata: linked product name, price, colours and first features, with no LLM call. Each product card below the answer shows its image and a product-page button. Curvv's price and some Altroz colours are not stored by the scraper, so they show as "Not indexed".
+- `Which SUV has a sunroof?` — lists only the products whose indexed text mentions a sunroof, each with a product-page link and the matching sentence. No price or unrelated facts are added.
 
-**Motorcycles / scooters**
-- `List Hero motorcycles with their mileage`
-- `What colours is the Hero scooter available in?`
-- `Compare scooters and bikes under 80000`
-
-**Spare parts**
-- `Find brake pads for a Hero motorcycle`
-- `What spare parts are available for Tata engines?`
-- `Show filters as a table with price`
+**Motorcycles, scooters and spare parts: known limitations**
+- Motorcycle and scooter rows have no model name in metadata. Their product name is taken from the page URL (`glamour-x.html` → Glamour X), so `Tell me about the Glamour X` returns only that product. The answer wording can still add loosely supported details from the 1.5B model.
+- **Known data defect:** the motorcycle and scooter loaders scrape shared Hero pages. Every page carries the same price (₹ 1,72,524) and the same images, and motorcycles such as Glamour X are indexed under scooters. Discovery accepts site-wide "buy now" links, and extraction reads the first price and image on the page rather than the product's own. Retrieval now marks a price shared by several products as "Not reliable" and hides images shared by several cards, but the underlying rows stay wrong until the loaders are fixed and re-ingested.
+- Spare-part questions such as `Which accelerator cable fits the Passion X PRO?` return the right row but with irrelevant rows around it, and the answer text is unreliable.
 
 **Category-agnostic (resolved by top vector match, since no category word is present)**
 - `What is the ground clearance of the Nexon?`
-- `Describe this product's interior features`
 
 **Image search** (switch "Search type" to *Image* in the sidebar)
 - `red SUV front view`
@@ -607,7 +615,7 @@ These three run **offline** — no PostgreSQL, Ollama, or network access needed.
 ## Roadmap
 
 **Near term**
-- Query understanding beyond keyword category matching (entities, intent)
+- ~~Query understanding beyond keyword category matching (entities, intent)~~ ✅ Rule-based version done; an LLM classifier is still open
 - Wire `pytesseract` OCR into the normalized document (installed but unused today)
 - Scheduled / incremental re-ingestion with change detection
 

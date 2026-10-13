@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import re
 import time
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 import asyncpg
 from requests import RequestException
@@ -49,42 +52,29 @@ async def search_similar(
     query_embedding: Sequence[float],
     category: str | None = None,
     top_k: int = 5,
-    modality: str = "text",
     metadata_version: str | None = None,
 ) -> list[asyncpg.Record]:
     if not query_embedding:
         return []
-    if modality not in {"text", "image"}:
-        raise ValueError("modality must be 'text' or 'image'")
 
     vector = "[" + ",".join(str(value) for value in query_embedding) + "]"
     limit = max(1, min(int(top_k), 50))
-    if modality == "text":
-        columns = "chunk_id, category, text, metadata"
-        table = "brochure_chunks"
-        vector_column = "text_embedding"
-        category_column = "category"
-    else:
-        columns = "i.image_id, i.chunk_id, c.category, c.text, i.metadata"
-        table = "brochure_images i JOIN brochure_chunks c ON c.chunk_id = i.chunk_id"
-        vector_column = "i.image_embedding"
-        category_column = "c.category"
 
     conditions: list[str] = []
     parameters: list[Any] = [vector, limit]
     idx = 3
     if category:
-        conditions.append(f"{category_column} = ${idx}")
+        conditions.append(f"category = ${idx}")
         parameters.append(category)
         idx += 1
     if metadata_version:
-        conditions.append(f"{'c.' if modality != 'text' else ''}metadata_version = ${idx}")
+        conditions.append(f"metadata_version = ${idx}")
         parameters.append(metadata_version)
         idx += 1
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-    query = f"SELECT {columns} FROM {table}{where} ORDER BY {vector_column} {VECTOR_OPERATOR} $1::vector LIMIT $2"
+    query = f"SELECT chunk_id, category, text, metadata FROM brochure_chunks{where} ORDER BY text_embedding {VECTOR_OPERATOR} $1::vector LIMIT $2"
 
-    logger.info("Vector search started | modality=%s | category=%s | version=%s | top_k=%d", modality, category, metadata_version, limit)
+    logger.info("Vector search started | category=%s | version=%s | top_k=%d", category, metadata_version, limit)
     connection = await asyncpg.connect(timeout=10, command_timeout=20, **DB_PARAMS)
     try:
         rows = list(await connection.fetch(query, *parameters))
@@ -101,7 +91,9 @@ async def search_keywords(
     """Full-text search via PostgreSQL tsvector + ts_rank (BM25-style keyword ranking)."""
     if not query or not query.strip():
         return []
-    query_terms = " & ".join(query.lower().split()[:5])
+    query_terms = " | ".join(re.findall(r"[a-z0-9]+", query.lower())[:8])
+    if not query_terms:
+        return []
     limit = max(1, min(int(top_k), 50))
     connection = await asyncpg.connect(timeout=10, command_timeout=20, **DB_PARAMS)
     try:
@@ -163,6 +155,7 @@ def generate_answer(query: str, context: str, language: str = "English") -> str:
     prompt = (
         f"{lang_line}"
         "You are an expert automotive knowledge assistant specializing in cars, motorcycles, scooters, and spare parts. "
+        "Answer only from the supplied context; never use outside knowledge. "
         "Answer ONLY about the specific product(s) mentioned in the question. Ignore unrelated products in the context.\n"
         "Rules:\n"
         "1. Identify the main product(s) in the question (e.g., 'Altroz', 'Hero bike'). Answer ONLY about those.\n"
@@ -203,35 +196,238 @@ def wants_table(query: str) -> bool:
     return any(term in normalized_query for term in ("table", "tabular", "columns"))
 
 
-def format_product_answer(rows: Sequence[asyncpg.Record], as_table: bool) -> str | None:
+GENERIC_NAME_WORDS = {"new", "the", "all", "tata", "hero", "suv", "kit", "ev", "ice", "en", "in"}
+PRICE_PATTERN = re.compile(r"price|cost|mrp|how much|rupee|lakh|emi|₹|rs\.?\s*\d", re.IGNORECASE)
+
+
+def wants_price(query: str) -> bool:
+    return bool(PRICE_PATTERN.search(query))
+
+
+def wants_comparison(query: str) -> bool:
+    return bool(re.search(r"\b(compare|comparison|versus|vs|difference)\b", query, re.IGNORECASE))
+
+
+COMPARE_SPLIT = re.compile(r"\s+(?:and|vs\.?|versus|with|to)\s+|,\s*", re.IGNORECASE)
+
+
+def unindexed_products(query: str, rows: Sequence[asyncpg.Record]) -> list[str]:
+    """Products named in a comparison question that no retrieved row mentions."""
+    if not wants_comparison(query):
+        return []
+    body = re.sub(r"\b(compare|comparison|between|of|the|difference)\b", " ", query, flags=re.IGNORECASE)
+    context_words = set()
+    for row in rows:
+        name = product_name(parse_metadata(row["metadata"]))
+        context_words |= set(re.findall(r"[a-z0-9]+", name.lower())) - GENERIC_NAME_WORDS
+    missing = []
+    for part in COMPARE_SPLIT.split(body):
+        words = set(re.findall(r"[a-z0-9]+", part.lower())) - GENERIC_NAME_WORDS
+        if words and not words & context_words:
+            missing.append(part.strip().strip("?.!"))
+    return missing
+
+
+def product_name(metadata: dict[str, Any]) -> str:
+    name = metadata.get("part_name") or metadata.get("model")
+    if name:
+        return str(name)
+    slug = str(metadata.get("product_url") or metadata.get("source_url") or "").rstrip("/").rsplit("/", 1)[-1]
+    return slug.removesuffix(".html").replace("-", " ").title()
+
+
+def named_products(query: str, rows: Sequence[asyncpg.Record]) -> list[asyncpg.Record]:
+    """Rows whose product name the query names in full ('Glamour X' -> glamour-x, not glamour-x-abs).
+    Falls back to the best partial overlap when no name is fully mentioned."""
+    names = [(row, set(re.findall(r"[a-z0-9]+", product_name(parse_metadata(row["metadata"])).lower())) - GENERIC_NAME_WORDS)
+             for row in rows]
+    vocabulary = set().union(*(words for _, words in names))
+    query_words = set(re.findall(r"[a-z0-9]+", query.lower()))
+    for word in list(query_words):
+        if len(word) >= 5:
+            query_words |= set(difflib.get_close_matches(word, vocabulary, n=3, cutoff=0.85))
+    full: list[tuple[int, asyncpg.Record]] = []
+    partial: list[tuple[int, asyncpg.Record]] = []
+    for row, name_words in names:
+        overlap = len(name_words & query_words)
+        if not overlap:
+            continue
+        if overlap == len(name_words):
+            full.append((len(name_words), row))
+        else:
+            partial.append((overlap, row))
+    if full:
+        longest = max(size for size, _ in full)
+        return [row for size, row in full if size == longest]
+    if partial:
+        best = max(score for score, _ in partial)
+        return [row for score, row in partial if score == best]
+    return []
+
+
+COLOUR_PATTERN = re.compile(r"colou?rs?|variants?", re.IGNORECASE)
+SPEC_PATTERN = re.compile(r"engine|mileage|seating|boot|airbag|safety|features?|dimensions?|specifications?", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class QueryIntent:
+    intents: frozenset[str]
+    named_rows: tuple[asyncpg.Record, ...]
+
+
+def understand_query(query: str, rows: Sequence[asyncpg.Record]) -> QueryIntent:
+    checks = {
+        "comparison": wants_comparison(query),
+        "price": wants_price(query),
+        "table": wants_table(query),
+        "colour": bool(COLOUR_PATTERN.search(query)),
+        "spec": bool(SPEC_PATTERN.search(query)),
+    }
+    intents = frozenset(name for name, hit in checks.items() if hit) or frozenset({"general"})
+    return QueryIntent(intents, tuple(named_products(query, rows)))
+
+
+STOP_WORDS = {
+    "which", "what", "show", "tell", "have", "has", "with", "does", "list", "about", "the", "and", "for", "are",
+    "any", "give", "can", "you", "that", "this", "there", "who", "how", "many", "much", "is", "of", "in", "on", "a",
+    "an", "to", "me", "all", "from", "its", "describe", "feature", "features", "details", "detail", "specification",
+    "specifications", "information", "info", "model", "models", "vehicle", "vehicles", "product", "products",
+}
+SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+PRICE_AMOUNT = re.compile(r"₹\s?[\d,.]+(?:\s*Lakh)?", re.IGNORECASE)
+
+
+def compact_price(value: Any) -> str:
+    text = str(value or "")
+    match = PRICE_AMOUNT.search(text)
+    return match.group(0) if match else (text[:40] or "Not indexed")
+
+
+def shown_price(rows: Sequence[asyncpg.Record], row: asyncpg.Record) -> str:
+    price = compact_price(parse_metadata(row["metadata"]).get("price"))
+    counts = Counter(compact_price(parse_metadata(r["metadata"]).get("price")) for r in rows)
+    if counts[price] > 1 and price != "Not indexed":
+        return "Not reliable (same price on several pages)"
+    return price
+
+
+def feature_terms(query: str) -> set[str]:
+    category_words = set().union(*CATEGORY_TERMS.values())
+    words = set(re.findall(r"[a-z]+", query.lower()))
+    return {word for word in words - STOP_WORDS - category_words if len(word) >= 3}
+
+
+def relevant_snippets(text: str, terms: set[str], limit: int) -> list[str]:
+    snippets = []
+    for sentence in SENTENCE_SPLIT.split(text):
+        sentence = sentence.strip()
+        lowered = sentence.lower()
+        positions = [lowered.find(term) for term in terms if term in lowered]
+        if positions:
+            start = sentence.rfind(" ", 0, max(0, min(positions) - 80)) + 1
+            snippets.append(sentence[start:start + 200])
+        if len(snippets) == limit:
+            break
+    return snippets
+
+
+def feature_matches(query: str, rows: Sequence[asyncpg.Record]) -> list[tuple[asyncpg.Record, str]]:
+    terms = feature_terms(query)
+    if not terms:
+        return []
+    matches = []
+    for row in rows:
+        snippets = relevant_snippets(str(row["text"] or ""), terms, 1)
+        if snippets:
+            matches.append((row, snippets[0]))
+    return matches
+
+
+def feature_list(matches: Sequence[tuple[asyncpg.Record, str]]) -> str:
+    lines = []
+    for row, snippet in matches:
+        metadata = parse_metadata(row["metadata"])
+        name = product_name(metadata) or "Not indexed"
+        link = metadata.get("product_url") or metadata.get("source_url")
+        product = f"[{name}]({link})" if link else name
+        lines.append(f"- **{product}**: {snippet}")
+    return "Products whose indexed details mention it:\n\n" + "\n".join(lines)
+
+
+def product_context(query: str, rows: Sequence[asyncpg.Record]) -> str:
+    terms = feature_terms(query)
+    blocks = []
+    for row in rows:
+        metadata = parse_metadata(row["metadata"])
+        name = product_name(metadata) or "Unknown product"
+        lines = [f"Product: {name}", f"Price: {compact_price(metadata.get('price'))}"]
+        colours = ", ".join(str(c) for c in metadata.get("color_variants") or [])
+        if colours:
+            lines.append(f"Colours: {colours}")
+        features = [str(f)[:80] for f in (metadata.get("features") or [])[:5]]
+        if features:
+            lines.append("Features: " + "; ".join(features))
+        lines.extend(relevant_snippets(str(row["text"] or ""), terms, 2))
+        blocks.append("\n".join(lines)[:800])
+    return "\n\n".join(blocks)
+
+
+def table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
+
+
+def feature_table(rows: Sequence[asyncpg.Record]) -> str:
+    lines = ["| Product | Price | Colours | Key features |", "| --- | --- | --- | --- |"]
+    for row in rows:
+        metadata = parse_metadata(row["metadata"])
+        name = product_name(metadata) or "Not indexed"
+        link = metadata.get("product_url") or metadata.get("source_url")
+        product = f"[{name}]({link})" if link else name
+        price = shown_price(rows, row)
+        colours = ", ".join(str(c) for c in metadata.get("color_variants") or []) or "Not indexed"
+        features = "; ".join(str(f)[:80] for f in (metadata.get("features") or [])[:4]) or "Not indexed"
+        lines.append(f"| {table_cell(product)} | {table_cell(price)} | {table_cell(colours)} | {table_cell(features)} |")
+    return "Here is the side-by-side comparison from the indexed catalog.\n\n" + "\n".join(lines)
+
+
+def format_product_answer(query: str, rows: Sequence[asyncpg.Record], as_table: bool) -> str | None:
+    show_price = wants_price(query)
     products = []
     for row in rows:
         metadata = parse_metadata(row["metadata"])
-        part_name = metadata.get("part_name") or metadata.get("model")
+        part_name = product_name(metadata)
         if not part_name:
             continue
         vehicle_type = metadata.get("vehicle_type") or metadata.get("vehicle_types") or "Not indexed"
         if isinstance(vehicle_type, list):
             vehicle_type = ", ".join(str(item) for item in vehicle_type)
-        products.append((str(part_name), str(metadata.get("price") or "Not indexed"), str(vehicle_type)))
+        products.append((
+            str(part_name),
+            shown_price(rows, row),
+            str(vehicle_type),
+            str(metadata.get("description") or "Not indexed"),
+        ))
 
     if not products:
         return None
 
-    def cell(value: str) -> str:
-        return value.replace("|", "\\|").replace("\n", " ")
+    cell = table_cell
 
-    if as_table:
+    if as_table and show_price:
         lines = ["| Part | Price | Vehicle type |", "| --- | --- | --- |"]
-        lines.extend(f"| {cell(part)} | {cell(price)} | {cell(vehicle)} |" for part, price, vehicle in products)
+        lines.extend(f"| {cell(part)} | {cell(price)} | {cell(vehicle)} |" for part, price, vehicle, _ in products)
         return "Here are the unique matching products from the indexed catalog.\n\n" + "\n".join(lines)
-
-    lines = [f"- **{part}**: {price}. Vehicle type: {vehicle}." for part, price, vehicle in products]
-    return "\n".join(lines)
+    if as_table:
+        lines = ["| Part | Description |", "| --- | --- |"]
+        lines.extend(f"| {cell(part)} | {cell(description)} |" for part, _, _, description in products)
+        return "Here are the unique matching products from the indexed catalog.\n\n" + "\n".join(lines)
+    if show_price:
+        return "\n".join(f"- **{part}**: {price}. Vehicle type: {vehicle}." for part, price, vehicle, _ in products)
+    return "\n".join(f"- **{part}**: {description}" for part, _, _, description in products)
 
 
 def fallback_answer(query: str, rows: Sequence[asyncpg.Record]) -> str:
-    product_answer = format_product_answer(rows, as_table=wants_table(query))
+    product_answer = format_product_answer(query, rows, as_table=wants_table(query))
     if product_answer:
         return product_answer
     excerpts = [str(row["text"])[:400] for row in rows]
@@ -245,39 +441,33 @@ def _has_useful_metadata(row: asyncpg.Record) -> bool:
 
 async def _search_with_version(
     query_embedding: Sequence[float], query: str, categories: list[str],
-    candidate_count: int, modality: str, metadata_version: str | None,
+    candidate_count: int, metadata_version: str | None,
 ) -> list[asyncpg.Record]:
     cat = categories[0] if len(categories) == 1 else None
-    tasks = [search_similar(query_embedding, cat, candidate_count, modality, metadata_version)]
-    if modality == "text":
-        tasks.append(search_keywords(query, categories, candidate_count, metadata_version))
-    results = await asyncio.gather(*tasks)
-    vector_rows = results[0]
-    keyword_rows = results[1] if len(results) > 1 else []
-    if modality == "text" and keyword_rows:
-        return rrf_fusion(vector_rows, keyword_rows)
-    return list(vector_rows)
+    vector_rows, keyword_rows = await asyncio.gather(
+        search_similar(query_embedding, cat, candidate_count, metadata_version=metadata_version),
+        search_keywords(query, categories, candidate_count, metadata_version),
+    )
+    return rrf_fusion(vector_rows, keyword_rows) if keyword_rows else list(vector_rows)
 
 
-async def search_in_category(
-    query: str, category: str | None, top_k: int, modality: str = "text"
-) -> list[asyncpg.Record]:
+async def search_in_category(query: str, category: str | None, top_k: int) -> list[asyncpg.Record]:
     """Vector + keyword hybrid search, category-scoped, fused with RRF.
     Prefers latest metadata_version; falls back to any version if no results."""
     query_embedding = await asyncio.wait_for(asyncio.to_thread(get_embedding, query), timeout=35)
     categories = [category] if category else categories_in(query)
     if not categories:
-        best = await search_similar(query_embedding, top_k=1, modality=modality)
+        best = await search_similar(query_embedding, top_k=1)
         categories = [best[0]["category"]] if best else []
     logger.info("Category scope | selected=%s | used=%s", category, categories)
 
     candidate_count = min(max(int(top_k) * 4, int(top_k)), 50)
     latest_version = await _latest_metadata_version()
-    rows = await _search_with_version(query_embedding, query, categories, candidate_count, modality, latest_version)
+    rows = await _search_with_version(query_embedding, query, categories, candidate_count, latest_version)
     useful = [r for r in rows if _has_useful_metadata(r)]
     if not useful and latest_version:
         logger.info("No results for version=%s, falling back to any version", latest_version)
-        rows = await _search_with_version(query_embedding, query, categories, candidate_count, modality, None)
+        rows = await _search_with_version(query_embedding, query, categories, candidate_count, None)
         useful = [r for r in rows if _has_useful_metadata(r)]
     # ponytail: if even fallback has no useful metadata, return raw rows rather than nothing
     return unique_by(useful or rows, product_identity, top_k)
@@ -290,21 +480,23 @@ async def retrieve_with_sources(
     logger.info("Retrieval request started | query=%r | category=%s", query, category)
     rows = await search_in_category(query, category, top_k * 2)
     unique_rows = unique_by(rows, product_identity, top_k * 2)
+    # ponytail: named products are matched within the top-2k pool, not the whole catalog; widen the pool if a named product is missed
+    understanding = understand_query(query, unique_rows)
+    logger.info("Query understanding | intents=%s | named_products=%d", sorted(understanding.intents), len(understanding.named_rows))
+    unique_rows = (list(understanding.named_rows) or unique_rows)[:top_k]
 
-    if len(unique_rows) > 1:
-        primary_product = product_identity(unique_rows[0])
-        same_product = [r for r in unique_rows if product_identity(r) == primary_product]
-        if len(same_product) >= top_k:
-            unique_rows = same_product[:top_k]
-            logger.info("Filtered to single product | product=%s | results=%d", primary_product, len(unique_rows))
-        else:
-            unique_rows = unique_rows[:top_k]
-    else:
-        unique_rows = unique_rows[:top_k]
-
-    context = "\n\n".join(str(row["text"]) for row in unique_rows)
-    if language == "English":
-        answer = format_product_answer(unique_rows, as_table=wants_table(query))
+    context = product_context(query, unique_rows)
+    missing = unindexed_products(query, unique_rows)
+    matches = feature_matches(query, unique_rows) if not understanding.named_rows else []
+    if language == "English" and missing:
+        note = "\n".join(f"**{name}**: not in the indexed catalog." for name in missing)
+        answer = note + "\n\n" + (feature_table(unique_rows) if unique_rows else "")
+    elif language == "English" and unique_rows and "comparison" in understanding.intents and understanding.intents & {"spec", "colour"}:
+        answer = feature_table(unique_rows)
+    elif language == "English" and understanding.intents & {"table", "price"} and "comparison" not in understanding.intents:
+        answer = format_product_answer(query, unique_rows, as_table=wants_table(query))
+    elif language == "English" and matches and "comparison" not in understanding.intents:
+        answer = feature_list(matches)
     else:
         answer = None
     if answer is None:
@@ -317,13 +509,6 @@ async def retrieve_with_sources(
                 answer = f"⚠ Generation in {language} failed (model timeout). Showing English fallback.\n\n{answer}"
     logger.info("Retrieval request completed | sources=%d | duration=%.2fs", len(unique_rows), time.monotonic() - started_at)
     return answer, unique_rows
-
-
-async def search_images_for_query(
-    query: str, category: str | None = None, top_k: int = 5
-) -> list[asyncpg.Record]:
-    rows = await search_in_category(query, category, top_k, modality="image")
-    return unique_by(rows, lambda row: str(row["chunk_id"]), top_k)
 
 
 async def retrieve_pipeline(query: str, category: str | None = None, top_k: int = 5, language: str = "English") -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.logger import setup_logger
-from retrieval.retriever import SUPPORTED_LANGUAGES, parse_metadata, retrieve_with_sources, search_images_for_query, wants_table
+from retrieval.retriever import SUPPORTED_LANGUAGES, parse_metadata, product_name, retrieve_with_sources
 
 logger = setup_logger(__name__)
 
@@ -21,44 +22,51 @@ def row_value(row: Any, field: str, default: Any = None) -> Any:
     return row[field] if field in row.keys() else default
 
 
-def render_sources(rows: list[Any], show_table: bool) -> None:
-    st.subheader("Sources")
+def product_image(metadata: dict[str, Any], shared: Counter[str]) -> str | None:
+    for image in metadata.get("images") or []:
+        path = image.get("local_path")
+        if path and Path(path).exists() and shared[path] == 1:
+            return path
+    return None
+
+
+def render_sources(rows: list[Any]) -> None:
     if not rows:
-        st.info("No indexed results matched this query.")
         return
+    st.markdown("**Sources**")
+    for row in rows:
+        metadata = parse_metadata(row_value(row, "metadata", {}))
+        name = product_name(metadata) or row_value(row, "chunk_id", "")
+        url = metadata.get("product_url") or metadata.get("source_url")
+        st.markdown(f"- [{name}]({url})" if url else f"- {name}")
 
-    prepared_rows = [(row, parse_metadata(row_value(row, "metadata", {}))) for row in rows]
-    if show_table:
-        table_rows = []
-        for row, metadata in prepared_rows:
-            vehicle_type = metadata.get("vehicle_type", "Not indexed")
-            table_rows.append({
-                "Part / model": metadata.get("part_name") or metadata.get("model") or row_value(row, "chunk_id", ""),
-                "Price": metadata.get("price") or "Not indexed",
-                "Vehicle type": ", ".join(vehicle_type) if isinstance(vehicle_type, list) else vehicle_type,
-            })
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
-    for row, metadata in prepared_rows:
-        title = metadata.get("part_name") or metadata.get("model") or row_value(row, "image_id") or row_value(row, "chunk_id", "Source")
-        with st.expander(str(title)):
-            if row_value(row, "text"):
-                st.write(str(row_value(row, "text"))[:1000])
-            image_reference = metadata.get("local_path") or metadata.get("image_url")
-            if image_reference:
-                st.image(image_reference, caption=metadata.get("caption") or None)
-            elif metadata.get("product_url"):
+def render_product_cards(rows: list[Any]) -> None:
+    if not rows:
+        return
+    metadatas = [parse_metadata(row_value(row, "metadata", {})) for row in rows]
+    shared: Counter[str] = Counter(
+        str(image.get("local_path")) for metadata in metadatas for image in metadata.get("images") or [] if image.get("local_path")
+    )
+    cols = st.columns(min(len(rows), 3))
+    for i, (row, metadata) in enumerate(zip(rows, metadatas)):
+        name = product_name(metadata) or row_value(row, "chunk_id", "")
+        with cols[i % len(cols)]:
+            image = product_image(metadata, shared)
+            if image:
+                st.image(image, caption=str(name))
+            else:
+                st.markdown(f"**{name}**")
+            if metadata.get("product_url"):
                 st.link_button("Open product page", metadata["product_url"])
-            logger.debug("Source metadata | source=%s | metadata=%s", title, metadata)
 
 
 st.set_page_config(page_title="Tata Automotive RAG", page_icon="T", layout="wide")
 st.title("Tata Automotive RAG")
+st.caption("Categories: cars | motorcycles | scooters | spare_parts")
 
 with st.sidebar:
     st.header("Search settings")
-    modality = st.radio("Search type", ["Text", "Image"], horizontal=True)
-    category = st.selectbox("Category", ["All", "cars", "motorcycles", "scooters", "spare_parts"])
     language = st.selectbox("Response language", list(SUPPORTED_LANGUAGES))
     top_k = st.slider("Results", min_value=1, max_value=10, value=5)
 
@@ -69,29 +77,14 @@ if search_clicked:
     if not query.strip():
         st.warning("Enter a question before searching.")
     else:
-        selected_category = None if category == "All" else category
-        logger.info("UI search started | modality=%s | category=%s | query=%r", modality, selected_category, query)
+        logger.info("UI search started | query=%r", query)
         try:
             with st.spinner("Searching the indexed knowledge base..."):
-                if modality == "Text":
-                    answer, rows = asyncio.run(
-                        retrieve_with_sources(query, category=selected_category, top_k=top_k, language=language)
-                    )
-                    st.subheader("Answer")
-                    st.markdown(answer)
-                else:
-                    rows = asyncio.run(
-                        search_images_for_query(query, category=selected_category, top_k=top_k)
-                    )
-                    st.subheader("Images")
-                    cols = st.columns(min(len(rows), 3)) if rows else []
-                    for i, row in enumerate(rows):
-                        meta = parse_metadata(row_value(row, "metadata", {}))
-                        img = meta.get("local_path") or meta.get("image_url")
-                        if img:
-                            with cols[i % len(cols)]:
-                                st.image(img, caption=meta.get("part_name") or meta.get("model") or "")
-            render_sources(rows, show_table=wants_table(query))
+                answer, rows = asyncio.run(retrieve_with_sources(query, top_k=top_k, language=language))
+                st.subheader("Answer")
+                st.markdown(answer)
+                render_sources(rows)
+                render_product_cards(rows)
             logger.info("UI search completed | results=%d", len(rows))
         except TimeoutError:
             logger.exception("UI search timed out")

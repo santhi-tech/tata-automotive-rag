@@ -7,7 +7,7 @@ from typing import Any
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from serving.api.deps import ProductItem, ProductListResponse, get_conn, get_current_user
+from api.deps import ProductItem, ProductListResponse, get_conn, get_current_user
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
