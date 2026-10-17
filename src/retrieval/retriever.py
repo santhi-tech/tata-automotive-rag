@@ -11,7 +11,7 @@ from typing import Any, Callable, Sequence
 import asyncpg
 from requests import RequestException
 from config.logger import setup_logger
-from config.settings import DB_PARAMS, VECTOR_OPERATOR
+from config.settings import DB_PARAMS, MULTILINGUAL_MODEL, VECTOR_OPERATOR
 from ingestion.embedding.embedder import Embedder
 
 logger = setup_logger(__name__)
@@ -50,7 +50,7 @@ async def _latest_metadata_version() -> str | None:
 
 async def search_similar(
     query_embedding: Sequence[float],
-    category: str | None = None,
+    category: str | Sequence[str] | None = None,
     top_k: int = 5,
     metadata_version: str | None = None,
 ) -> list[asyncpg.Record]:
@@ -59,13 +59,14 @@ async def search_similar(
 
     vector = "[" + ",".join(str(value) for value in query_embedding) + "]"
     limit = max(1, min(int(top_k), 50))
+    categories = [category] if isinstance(category, str) else list(category or [])
 
     conditions: list[str] = []
     parameters: list[Any] = [vector, limit]
     idx = 3
-    if category:
-        conditions.append(f"category = ${idx}")
-        parameters.append(category)
+    if categories:
+        conditions.append(f"category = ANY(${idx}::text[])")
+        parameters.append(categories)
         idx += 1
     if metadata_version:
         conditions.append(f"metadata_version = ${idx}")
@@ -148,12 +149,85 @@ def unique_by(rows: Sequence[asyncpg.Record], key: Callable[[Any], str], limit: 
 SUPPORTED_LANGUAGES = {"English": "", "German": "German", "Hindi": "Hindi", "Telugu": "Telugu"}
 
 
-def generate_answer(query: str, context: str, language: str = "English") -> str:
+TRANSLATE_TIMEOUT = 240
+
+
+LINK_PATTERN = re.compile(r"\[[^\]]+\]\([^)]+\)")
+
+
+def _ollama_translate(prompt: str, max_tokens: int) -> str:
+    result = embedder.generate_text(prompt, timeout=TRANSLATE_TIMEOUT, model=MULTILINGUAL_MODEL or None, max_tokens=max_tokens)
+    return re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
+
+
+def needs_translation(query: str) -> bool:
+    """True when a question is not English: non-ASCII script, or a sentence with almost no English function words."""
+    if not query.isascii():
+        return True
+    words = re.findall(r"[a-z]+", query.lower())
+    return len(words) >= 3 and sum(word in STOP_WORDS for word in words) < 2
+
+
+def translate_query(query: str) -> str:
+    prompt = (
+        "Translate this question into English. Reply with only the English question on one line. "
+        "Keep product names unchanged. Do not answer the question.\n\n"
+        f"Question: {query}\nEnglish:"
+    )
+    logger.info("Query translation started | model=%s", MULTILINGUAL_MODEL)
+    lines = _ollama_translate(prompt, 60).splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else query
+
+
+def translate_answer(text: str, target: str) -> str:
+    """Translate a finished English answer. Facts are decided in English first; product links are protected."""
+    links = LINK_PATTERN.findall(text)
+    for index, link in enumerate(links):
+        text = text.replace(link, f"@@{index}@@", 1)
+    prompt = (
+        f"Translate the text below into {target}. Output only the translation, nothing else. "
+        "Keep the Markdown structure (tables, bullets, bold). "
+        "Keep numbers, prices and every @@N@@ marker exactly as written.\n\n"
+        f"{text}\n\nTranslation:"
+    )
+    logger.info("Answer translation started | target=%s | model=%s | chars=%d", target, MULTILINGUAL_MODEL, len(text))
+    translated = _ollama_translate(prompt, 700)
+    for index, link in enumerate(links):
+        if f"@@{index}@@" not in translated:
+            raise ValueError("translation dropped a product link")
+        translated = translated.replace(f"@@{index}@@", link)
+    return translated
+
+
+PRICE_PHRASE = re.compile(
+    r"(?:\s*(?:starting|priced)\s+(?:from|at))?\s*₹\s?[\d,.]+\s*(?:lakh|l)?\b\s*\*?\s*(?:\(ex-showroom\))?", re.IGNORECASE
+)
+
+
+def catalog_overview(rows: Sequence[asyncpg.Record]) -> str:
+    """Overview for a general question, built only from indexed page descriptions: no model call, nothing invented, no prices.
+    One intro sentence per category + one sentence per product + one closing line (~7 sentences for 5 products)."""
+    by_category: dict[str, list[str]] = {}
+    lines = []
+    for row in rows:
+        metadata = parse_metadata(row["metadata"])
+        name = product_name(metadata)
+        by_category.setdefault(str(row["category"]), []).append(name)
+        description = re.sub(r"\s{2,}", " ", PRICE_PHRASE.sub(" ", str(metadata.get("description") or ""))).strip()
+        first = SENTENCE_SPLIT.split(description)[0].strip().rstrip(".!") if description else ""
+        if first:
+            lines.append(f"**{name}**: {first}.")
+    intro = " ".join(
+        f"The indexed catalog has {len(names)} {category.replace('_', ' ')}: {', '.join(names)}." for category, names in by_category.items()
+    )
+    outro = "Ask about a specific model or category to see its price, colours, features and images."
+    return "\n\n".join([intro, *lines, outro])
+
+
+def generate_answer(query: str, context: str) -> str:
     if not context.strip():
         return "I could not find indexed automotive information matching that question."
-    lang_line = f"You MUST respond entirely in {SUPPORTED_LANGUAGES[language]}. " if language != "English" else ""
     prompt = (
-        f"{lang_line}"
         "You are an expert automotive knowledge assistant specializing in cars, motorcycles, scooters, and spare parts. "
         "Answer only from the supplied context; never use outside knowledge. "
         "Answer ONLY about the specific product(s) mentioned in the question. Ignore unrelated products in the context.\n"
@@ -164,10 +238,9 @@ def generate_answer(query: str, context: str, language: str = "English") -> str:
         "4. If a field is missing (e.g., no colors indexed), state: 'Colors not indexed for this product'.\n"
         "5. Be specific and avoid generic repeated data. Answer directly in 2–4 sentences + table/list.\n\n"
         f"Question: {query}\n\nContext:\n{context}\n\n"
-        f"{'Respond entirely in ' + SUPPORTED_LANGUAGES[language] + '.\\n' if language != 'English' else ''}"
         "Answer:"
     )
-    logger.info("Answer generation started | language=%s | model=%s | context_chars=%d", language, embedder.gen_model, len(context))
+    logger.info("Answer generation started | model=%s | context_chars=%d", embedder.gen_model, len(context))
     return embedder.generate_text(prompt, timeout=60, max_tokens=300)
 
 
@@ -224,7 +297,8 @@ def unindexed_products(query: str, rows: Sequence[asyncpg.Record]) -> list[str]:
     for part in COMPARE_SPLIT.split(body):
         words = set(re.findall(r"[a-z0-9]+", part.lower())) - GENERIC_NAME_WORDS
         if words and not words & context_words:
-            missing.append(part.strip().strip("?.!"))
+            label = " ".join(w for w in part.split() if w.lower().strip("?.!,") not in STOP_WORDS)
+            missing.append(label.strip("?.!, ") or part.strip())
     return missing
 
 
@@ -236,33 +310,62 @@ def product_name(metadata: dict[str, Any]) -> str:
     return slug.removesuffix(".html").replace("-", " ").title()
 
 
+def name_words(row: asyncpg.Record) -> set[str]:
+    """Distinctive words of a product name; empty for landing pages such as the Hero home page ("En In")."""
+    words = set(re.findall(r"[a-z0-9]+", product_name(parse_metadata(row["metadata"])).lower()))
+    return words - GENERIC_NAME_WORDS - STOP_WORDS - {"for", "or"}
+
+
 def named_products(query: str, rows: Sequence[asyncpg.Record]) -> list[asyncpg.Record]:
     """Rows whose product name the query names in full ('Glamour X' -> glamour-x, not glamour-x-abs).
     Falls back to the best partial overlap when no name is fully mentioned."""
-    names = [(row, set(re.findall(r"[a-z0-9]+", product_name(parse_metadata(row["metadata"])).lower())) - GENERIC_NAME_WORDS)
-             for row in rows]
+    names = [(row, name_words(row)) for row in rows]
     vocabulary = set().union(*(words for _, words in names))
     query_words = set(re.findall(r"[a-z0-9]+", query.lower()))
     for word in list(query_words):
         if len(word) >= 5:
             query_words |= set(difflib.get_close_matches(word, vocabulary, n=3, cutoff=0.85))
-    full: list[tuple[int, asyncpg.Record]] = []
+    full: list[tuple[set[str], asyncpg.Record]] = []
     partial: list[tuple[int, asyncpg.Record]] = []
-    for row, name_words in names:
-        overlap = len(name_words & query_words)
+    for row, words in names:
+        overlap = len(words & query_words)
         if not overlap:
             continue
-        if overlap == len(name_words):
-            full.append((len(name_words), row))
+        if overlap == len(words):
+            full.append((words, row))
         else:
             partial.append((overlap, row))
     if full:
-        longest = max(size for size, _ in full)
-        return [row for size, row in full if size == longest]
+        # drop a name only when a longer matched name contains it ("Glamour X" inside "Glamour X ABS")
+        return [row for words, row in full if not any(words < other for other, _ in full)]
     if partial:
         best = max(score for score, _ in partial)
         return [row for score, row in partial if score == best]
     return []
+
+
+AUTOMOTIVE_TERMS = set().union(*CATEGORY_TERMS.values()) | {
+    "automobile", "automotive", "tata", "hero", "price", "prices", "cost", "costs", "lakh", "emi", "showroom",
+    "mileage", "engine", "engines", "cc", "bhp", "torque", "fuel", "petrol", "diesel", "electric", "ev", "cng",
+    "hybrid", "battery", "charging", "colour", "colours", "color", "colors", "variant", "variants", "sunroof",
+    "airbag", "airbags", "safety", "ncap", "abs", "brake", "brakes", "tyre", "tyres", "tire", "tires", "wheel",
+    "wheels", "alloy", "alloys", "seat", "seats", "seating", "boot", "transmission", "gear", "gears", "clutch",
+    "interior", "exterior", "infotainment", "adas", "cabin", "headlamp", "headlamps", "feature", "features",
+    "specification", "specifications", "spec", "specs", "accessory", "accessories", "cable", "piston", "chain",
+    "filter", "kicklever", "helmet", "dealer", "warranty", "drive", "driving", "ride", "riding",
+}
+# Fixed text, not model output: an off-topic question must never reach the LLM, in any language.
+OUT_OF_SCOPE = {
+    "English": "I can only answer questions about the cars, motorcycles, scooters and spare parts in the indexed catalog.",
+    "German": "Ich kann nur Fragen zu den Autos, Motorrädern, Rollern und Ersatzteilen im indexierten Katalog beantworten.",
+    "Hindi": "मैं केवल इंडेक्स किए गए कैटलॉग की कारों, मोटरसाइकिलों, स्कूटरों और स्पेयर पार्ट्स के बारे में प्रश्नों का उत्तर दे सकता हूँ।",
+    "Telugu": "నేను ఇండెక్స్ చేసిన కేటలాగ్‌లోని కార్లు, మోటార్‌సైకిళ్లు, స్కూటర్లు మరియు స్పేర్ పార్ట్స్ గురించిన ప్రశ్నలకు మాత్రమే సమాధానం ఇవ్వగలను.",
+}
+
+
+def is_automotive(query: str, named_rows: Sequence[asyncpg.Record]) -> bool:
+    """In scope when the (English) question names an indexed product or uses an automotive term."""
+    return bool(named_rows) or bool(set(re.findall(r"[a-z0-9]+", query.lower())) & AUTOMOTIVE_TERMS)
 
 
 COLOUR_PATTERN = re.compile(r"colou?rs?|variants?", re.IGNORECASE)
@@ -311,10 +414,15 @@ def shown_price(rows: Sequence[asyncpg.Record], row: asyncpg.Record) -> str:
     return price
 
 
+OVERVIEW_WORDS = {"explain", "overview", "summary", "summarize", "automotive", "automobile", "company", "brand", "brands", "general", "catalog", "catalogue"}
+
+
 def feature_terms(query: str) -> set[str]:
+    """Words that name a feature to look for. Brand and overview words are excluded: every Tata page says "Brand: tata"."""
     category_words = set().union(*CATEGORY_TERMS.values())
     words = set(re.findall(r"[a-z]+", query.lower()))
-    return {word for word in words - STOP_WORDS - category_words if len(word) >= 3}
+    excluded = STOP_WORDS | category_words | GENERIC_NAME_WORDS | OVERVIEW_WORDS
+    return {word for word in words - excluded if len(word) >= 3}
 
 
 def relevant_snippets(text: str, terms: set[str], limit: int) -> list[str]:
@@ -360,7 +468,7 @@ def product_context(query: str, rows: Sequence[asyncpg.Record]) -> str:
     for row in rows:
         metadata = parse_metadata(row["metadata"])
         name = product_name(metadata) or "Unknown product"
-        lines = [f"Product: {name}", f"Price: {compact_price(metadata.get('price'))}"]
+        lines = [f"Product: {name}", f"Price: {shown_price(rows, row)}"]
         colours = ", ".join(str(c) for c in metadata.get("color_variants") or [])
         if colours:
             lines.append(f"Colours: {colours}")
@@ -443,9 +551,8 @@ async def _search_with_version(
     query_embedding: Sequence[float], query: str, categories: list[str],
     candidate_count: int, metadata_version: str | None,
 ) -> list[asyncpg.Record]:
-    cat = categories[0] if len(categories) == 1 else None
     vector_rows, keyword_rows = await asyncio.gather(
-        search_similar(query_embedding, cat, candidate_count, metadata_version=metadata_version),
+        search_similar(query_embedding, categories, candidate_count, metadata_version=metadata_version),
         search_keywords(query, categories, candidate_count, metadata_version),
     )
     return rrf_fusion(vector_rows, keyword_rows) if keyword_rows else list(vector_rows)
@@ -477,38 +584,62 @@ async def retrieve_with_sources(
     query: str, category: str | None = None, top_k: int = 5, language: str = "English"
 ) -> tuple[str, list[asyncpg.Record]]:
     started_at = time.monotonic()
-    logger.info("Retrieval request started | query=%r | category=%s", query, category)
+    logger.info("Retrieval request started | query=%r | category=%s | language=%s", query, category, language)
+    if needs_translation(query):
+        try:
+            query = await asyncio.wait_for(asyncio.to_thread(translate_query, query), timeout=TRANSLATE_TIMEOUT + 5)
+            logger.info("Query translated | english=%r", query)
+        except (RequestException, TimeoutError, asyncio.TimeoutError):
+            logger.warning("Query translation failed; searching with the original text")
     rows = await search_in_category(query, category, top_k * 2)
-    unique_rows = unique_by(rows, product_identity, top_k * 2)
+    unique_rows = [row for row in unique_by(rows, product_identity, top_k * 2) if name_words(row)]
     # ponytail: named products are matched within the top-2k pool, not the whole catalog; widen the pool if a named product is missed
     understanding = understand_query(query, unique_rows)
     logger.info("Query understanding | intents=%s | named_products=%d", sorted(understanding.intents), len(understanding.named_rows))
+    if not is_automotive(query, understanding.named_rows):
+        logger.info("Out of scope | query=%r", query)
+        return OUT_OF_SCOPE.get(language, OUT_OF_SCOPE["English"]), []
+    specific = understanding.named_rows or categories_in(query) or feature_terms(query) or understanding.intents - {"general"}
+    if not specific:
+        logger.info("Overview question | query=%r", query)
+        return await localize(catalog_overview(unique_rows[:top_k]), language), []
     unique_rows = (list(understanding.named_rows) or unique_rows)[:top_k]
 
     context = product_context(query, unique_rows)
     missing = unindexed_products(query, unique_rows)
     matches = feature_matches(query, unique_rows) if not understanding.named_rows else []
-    if language == "English" and missing:
+    if missing:
         note = "\n".join(f"**{name}**: not in the indexed catalog." for name in missing)
         answer = note + "\n\n" + (feature_table(unique_rows) if unique_rows else "")
-    elif language == "English" and unique_rows and "comparison" in understanding.intents and understanding.intents & {"spec", "colour"}:
+    elif unique_rows and "comparison" in understanding.intents and understanding.intents & {"spec", "colour"}:
         answer = feature_table(unique_rows)
-    elif language == "English" and understanding.intents & {"table", "price"} and "comparison" not in understanding.intents:
+    elif understanding.intents & {"table", "price"} and "comparison" not in understanding.intents:
         answer = format_product_answer(query, unique_rows, as_table=wants_table(query))
-    elif language == "English" and matches and "comparison" not in understanding.intents:
+    elif matches and "comparison" not in understanding.intents:
         answer = feature_list(matches)
     else:
         answer = None
     if answer is None:
         try:
-            answer = await asyncio.wait_for(asyncio.to_thread(generate_answer, query, context, language), timeout=65)
+            answer = await asyncio.wait_for(asyncio.to_thread(generate_answer, query, context), timeout=65)
         except (RequestException, TimeoutError, asyncio.TimeoutError):
-            logger.warning("Answer generation failed | language=%s", language)
+            logger.warning("Answer generation failed")
             answer = fallback_answer(query, unique_rows)
-            if language != "English":
-                answer = f"⚠ Generation in {language} failed (model timeout). Showing English fallback.\n\n{answer}"
+    answer = await localize(answer, language)
     logger.info("Retrieval request completed | sources=%d | duration=%.2fs", len(unique_rows), time.monotonic() - started_at)
     return answer, unique_rows
+
+
+async def localize(answer: str, language: str) -> str:
+    if language == "English":
+        return answer
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(translate_answer, answer, SUPPORTED_LANGUAGES[language]), timeout=TRANSLATE_TIMEOUT + 5
+        )
+    except (RequestException, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
+        logger.warning("Answer translation failed | language=%s | %s", language, exc)
+        return f"⚠ Translation to {language} failed. Showing the English answer.\n\n{answer}"
 
 
 async def retrieve_pipeline(query: str, category: str | None = None, top_k: int = 5, language: str = "English") -> str:

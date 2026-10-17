@@ -2,6 +2,8 @@ import pytest
 from src.ingestion.pipeline import run_ingestion
 from src.retrieval.retriever import retrieve_pipeline
 
+pytestmark = pytest.mark.integration
+
 @pytest.mark.asyncio
 async def test_e2e_pipeline():
     await run_ingestion()

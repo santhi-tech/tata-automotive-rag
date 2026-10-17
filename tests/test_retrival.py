@@ -1,4 +1,5 @@
 import pytest
+from retrieval import retriever
 from retrieval.retriever import feature_list, feature_matches, feature_table, feature_terms, get_embedding, named_products, parse_metadata, product_context, retrieve_with_sources, search_similar, shown_price, understand_query, unindexed_products, wants_comparison
 
 
@@ -42,6 +43,97 @@ def test_shared_price_is_not_claimed_per_product():
     ]
     assert "Not reliable" in shown_price(rows, rows[0])
     assert shown_price(rows, rows[2]) == "₹7,39,990"
+
+
+def test_comparison_keeps_every_named_product_and_clean_missing_label():
+    rows = [
+        {"metadata": {"model": "Altroz"}, "text": "a"},
+        {"metadata": {"model": "Curvv Series X"}, "text": "c"},
+        {"metadata": {"model": "Nexon"}, "text": "n"},
+    ]
+    question = "Compare features of Altroz, Curvv Series X"
+    assert sorted(r["text"] for r in named_products(question, rows)) == ["a", "c"]
+    assert unindexed_products(question, rows) == []
+    assert unindexed_products("Compare features of Altroz, Punch", rows) == ["Punch"]
+
+
+HERO_POOL = [
+    {"metadata": {"product_url": "https://www.heromotocorp.com/en-in.html", "price": "₹ 1,72,524"}, "text": "Hero in India"},
+    {"metadata": {"product_url": "https://www.heromotocorp.com/en-in/buy-now/destini-110.html", "price": "₹ 1,72,524"}, "text": "Destini India"},
+    {"metadata": {"product_url": "https://www.heromotocorp.com/en-in/buy-now/glamour-x.html", "price": "₹ 1,72,524"}, "text": "Glamour"},
+]
+
+
+def test_scope_check_rejects_general_knowledge_and_accepts_automotive():
+    assert not retriever.is_automotive("What is the capital of India?", [])
+    assert retriever.is_automotive("Which SUV has a sunroof?", [])
+    assert retriever.is_automotive("how come all scooters and motorcycles are in same cost", [])
+    named = named_products("Tell me about the Glamour X", HERO_POOL)
+    assert retriever.is_automotive("Tell me about the Glamour X", named)
+    assert named_products("What is the capital of India?", HERO_POOL) == []
+
+
+@pytest.mark.asyncio
+async def test_off_topic_question_is_refused_in_the_chosen_language(monkeypatch):
+    async def fake_search(query, category, top_k):
+        return HERO_POOL
+
+    monkeypatch.setattr(retriever, "search_in_category", fake_search)
+    monkeypatch.setattr(retriever, "translate_query", lambda query: "What is the capital of India?")
+    answer, rows = await retrieve_with_sources("What is the capital of India?")
+    assert (answer, rows) == (retriever.OUT_OF_SCOPE["English"], [])
+    answer, rows = await retrieve_with_sources("భారతదేశ రాజధాని ఏమిటి?", language="Telugu")
+    assert (answer, rows) == (retriever.OUT_OF_SCOPE["Telugu"], [])
+
+
+CAR_POOL = [
+    {"category": "cars", "text": "Brand: tata. Panoramic sunroof.", "metadata": {
+        "model": "Nexon", "brand": "Tata",
+        "description": "Discover the Tata Nexon starting from ₹7.39 L * (ex-showroom) with bold design. Book now!"}},
+    {"category": "cars", "text": "Brand: tata. 6 airbags.", "metadata": {
+        "model": "Altroz", "brand": "Tata",
+        "description": "Explore the Tata Altroz starting from ₹5.99 Lakh* featuring petrol & diesel engines. Explore features & book now!"}},
+]
+
+
+@pytest.mark.asyncio
+async def test_general_question_gets_an_overview_without_products(monkeypatch):
+    async def fake_search(query, category, top_k):
+        return CAR_POOL
+
+    monkeypatch.setattr(retriever, "search_in_category", fake_search)
+    monkeypatch.setattr(retriever, "generate_answer", lambda query, context: "specific answer")
+    assert feature_terms("Explain details about tata automotive") == set()
+    answer, rows = await retrieve_with_sources("Explain details about tata automotive")
+    assert rows == [] and "₹" not in answer and "Book now" not in answer
+    assert "The indexed catalog has 2 cars: Nexon, Altroz." in answer
+    assert "**Nexon**: Discover the Tata Nexon with bold design." in answer
+    assert "**Altroz**: Explore the Tata Altroz featuring petrol & diesel engines." in answer
+    answer, rows = await retrieve_with_sources("Tell me about Tata cars")
+    assert answer == "specific answer" and len(rows) == 2
+
+
+def test_home_page_is_not_a_product_and_shared_price_is_hidden_from_the_model():
+    assert retriever.name_words(HERO_POOL[0]) == set()
+    context = product_context("price of destini", HERO_POOL[1:])
+    assert "₹ 1,72,524" not in context and "Not reliable" in context
+
+
+def test_needs_translation_only_for_non_english_questions():
+    for english in ("Which SUV has a sunroof?", "Compare features of Altroz, Curvv Series X",
+                    "tell me the price of destiny scooter", "Altroz colours"):
+        assert not retriever.needs_translation(english), english
+    for other in ("Welche SUVs haben ein Schiebedach?", "Nexon ki keemat kya hai?", "नेक्सन की कीमत क्या है?"):
+        assert retriever.needs_translation(other), other
+
+
+def test_translate_answer_protects_product_links(monkeypatch):
+    answer = "- **[Nexon](https://tata.cars/nexon/ice.html)**: Panoramic Sunroof"
+    monkeypatch.setattr(retriever, "_ollama_translate", lambda prompt, max_tokens: "- **@@0@@**: Panorama-Schiebedach")
+    assert retriever.translate_answer(answer, "German") == "- **[Nexon](https://tata.cars/nexon/ice.html)**: Panorama-Schiebedach"
+    monkeypatch.setattr(retriever, "_ollama_translate", lambda prompt, max_tokens: "- **Nexon**: Panorama-Schiebedach")
+    with pytest.raises(ValueError):
+        retriever.translate_answer(answer, "German")
 
 
 def test_wants_comparison():
@@ -102,6 +194,7 @@ def test_unindexed_products_flags_models_missing_from_context():
     assert unindexed_products("How many colours does the Altroz come in?", rows) == []
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_search_similar():
     emb = get_embedding("Electric cars")
@@ -109,6 +202,7 @@ async def test_search_similar():
     assert isinstance(rows, list)
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_compare_question_returns_only_named_products():
     _answer, rows = await retrieve_with_sources("Compare the Altroz and the Punch", category="cars", top_k=5)

@@ -8,6 +8,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.deps import ProductItem, ProductListResponse, get_conn, get_current_user
+from retrieval.retriever import OUT_OF_SCOPE, is_automotive, name_words, named_products, product_name, search_keywords
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -23,7 +24,7 @@ def _parse_product(row: asyncpg.Record) -> ProductItem:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    name = meta.get("part_name") or meta.get("vehicle_name") or meta.get("model") or None
+    name = product_name(meta) or None
     vtype = meta.get("vehicle_type") or meta.get("vehicle_types")
     if isinstance(vtype, list):
         vtype = ", ".join(str(v) for v in vtype)
@@ -93,24 +94,8 @@ async def search_products(
 ):
     if category and category not in VALID_CATEGORIES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"category must be one of {sorted(VALID_CATEGORIES)}")
-    terms = " & ".join(q.lower().split()[:5])
-    conn = await get_conn()
-    try:
-        if category:
-            rows = await conn.fetch(
-                """SELECT category, text, metadata::text as metadata FROM brochure_chunks
-                   WHERE to_tsvector('english', text) @@ to_tsquery('english', $1) AND category = $2
-                   ORDER BY ts_rank(to_tsvector('english', text), to_tsquery('english', $1)) DESC LIMIT $3""",
-                terms, category, limit,
-            )
-        else:
-            rows = await conn.fetch(
-                """SELECT category, text, metadata::text as metadata FROM brochure_chunks
-                   WHERE to_tsvector('english', text) @@ to_tsquery('english', $1)
-                   ORDER BY ts_rank(to_tsvector('english', text), to_tsquery('english', $1)) DESC LIMIT $2""",
-                terms, limit,
-            )
-    finally:
-        await conn.close()
+    rows = [r for r in await search_keywords(q, [category] if category else None, limit) if name_words(r)]
+    if not is_automotive(q, named_products(q, rows)):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, OUT_OF_SCOPE["English"])
     products = [_parse_product(r) for r in rows]
     return ProductListResponse(category=category or "all", count=len(products), products=products)

@@ -90,6 +90,7 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Image vector search at query time | ✅ Implemented | `search_images_for_query`, same category scoping as text |
 | HNSW vector indexes | ✅ Implemented | `MetadataStore._ensure_indexes`; falls back to exact scan on pgvector < 0.5 |
 | Containerized ingestion | ✅ Implemented | `Dockerfile` (Chromium + Playwright deps baked in) |
+| Automotive-only scope | ✅ Implemented | `is_automotive()` refuses questions that name no indexed product and use no automotive term (e.g. "What is the capital of India?"). The refusal is fixed text per language, so no model call is made and nothing is generated from general knowledge |
 | Query understanding: intent and product entities | ✅ Implemented | `retriever.py::understand_query` labels intents (comparison, price, table, colour, spec, general) and matches product names against retrieved rows; rule-based, not an LLM classifier |
 | Keyword search (BM25) + score fusion (RRF) | ✅ Implemented | `search_keywords()` via PostgreSQL tsvector; fused with vector results via RRF in `search_in_category()` |
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
@@ -469,7 +470,8 @@ All settings are environment variables (or `.env`); every one has a working defa
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Trailing `/api` and `localhost` are normalized automatically |
 | `EMBEDDING_MODEL` | `nomic-embed-text:latest` | Used for both query and caption embeddings |
 | `VISION_MODEL` | `llava:latest` | Image captioning |
-| `GENERATION_MODEL` | — | Answer generation |
+| `GENERATION_MODEL` | — | Answer generation for English |
+| `MULTILINGUAL_MODEL` | — (set in `.env`; `qwen3:8b` recommended) | Ollama model used only for translation. Non-English questions are translated to English, the answer is computed in English, then the finished answer is translated to German, Hindi or Telugu with product links protected. Benchmarked: `qwen3:8b` translated "Schiebedach" to "sunroof" and kept answers complete; `llama3.1:8b` gave "sliding roof" and dropped lines. Expect 12–95 s per non-English answer on CPU |
 | `VISION_MAX_TOKENS` | `120` | Caps caption length — on CPU-only Ollama, an uncapped caption can take 50s+ and blow the per-image timeout |
 | `EMBEDDING_DIM` | `768` | Must equal `nomic-embed-text`'s actual output size; mismatches fail loudly at startup, not mid-insert |
 | `VECTOR_DISTANCE` | `l2` | `l2` or `cosine` — controls both the SQL operator and the HNSW index opclass |
@@ -512,6 +514,7 @@ Counts from the `brochure_chunks` table, metadata about the products, and the `b
 - `Show the Harrier and the Nexon as a table with price`
 - `Compare the Altroz and the Punch` — answers with the Altroz only and states `**Punch**: not in the indexed catalog.` (Punch is not loaded, so it is never described from general knowledge)
 - `Compare features of Altroz, Curvv Series X` — side-by-side table built from indexed metadata: linked product name, price, colours and first features, with no LLM call. Each product card below the answer shows its image and a product-page button. Curvv's price and some Altroz colours are not stored by the scraper, so they show as "Not indexed".
+- `Explain details about tata automotive` — a general question with no product, category or feature named gets an overview built from the indexed page descriptions: one line naming the models, one sentence per model, no prices and no product cards. No model call is made, so nothing is invented
 - `Which SUV has a sunroof?` — lists only the products whose indexed text mentions a sunroof, each with a product-page link and the matching sentence. No price or unrelated facts are added.
 
 **Motorcycles, scooters and spare parts: known limitations**
@@ -605,10 +608,13 @@ User accounts are stored in PostgreSQL (`api_users` table, created automatically
 ## Running Tests
 
 ```bash
-uv run python -m pytest tests/test_cars_urls.py tests/test_image_store.py tests/test_retriever_formatting.py
+uv run pytest -m "not integration"   # offline: what CI runs on every push and pull request
+uv run pytest -m integration         # needs running Ollama + PostgreSQL configured in .env
 ```
 
-These three run **offline** — no PostgreSQL, Ollama, or network access needed. The rest (`test_embedding.py`, `test_ingestion.py`, `test_retrival.py`, `evaluation.py`, `test_e2e.py`) exercise the real stack and need a running Ollama + PostgreSQL with `.env` configured; `test_ingestion.py` writes a test document into whichever database `.env` points at, so point it at a disposable database rather than production data.
+Offline tests need no PostgreSQL, Ollama, or network access. Tests marked `integration` (`test_embedding.py`, `test_ingestion.py`, `test_e2e.py`, and the database tests in `test_retrival.py`) exercise the real stack. `test_ingestion.py` writes a test document into whichever database `.env` points at, so point it at a disposable database rather than production data.
+
+GitHub Actions (`.github/workflows/ci.yml`) installs from `uv.lock`, compiles `src/`, and runs the offline tests on Python 3.12.
 
 ---
 

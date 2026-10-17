@@ -50,3 +50,8 @@ if VECTOR_DISTANCE not in _OPERATORS:
     raise ValueError(f"VECTOR_DISTANCE must be one of {sorted(_OPERATORS)}, got {VECTOR_DISTANCE!r}")
 VECTOR_OPERATOR = _OPERATORS[VECTOR_DISTANCE]
 VECTOR_OPCLASS = "vector_l2_ops" if VECTOR_DISTANCE == "l2" else "vector_cosine_ops"
+
+# --- Generation ------------------------------------------------------------
+# Answers in any language other than English use this model; English keeps GENERATION_MODEL.
+# qwen2.5:1.5b produced wrong German and unusable Hindi/Telugu; llama3.1:8b answered all three correctly.
+MULTILINGUAL_MODEL = get("MULTILINGUAL_MODEL")

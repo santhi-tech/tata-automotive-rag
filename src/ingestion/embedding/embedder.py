@@ -64,7 +64,8 @@ class Embedder:
     def generate_text(self, prompt: str, timeout: float = 120, model: str | None = None, max_tokens: int = 0) -> str:
         if not prompt or not prompt.strip():
             return ""
-        payload: dict[str, Any] = {"model": model or self.gen_model, "prompt": prompt, "stream": False}
+        # think=False: Qwen3 otherwise reasons at length before answering, which is slow on CPU
+        payload: dict[str, Any] = {"model": model or self.gen_model, "prompt": prompt, "stream": False, "think": False}
         if max_tokens > 0:
             payload["options"] = {"num_predict": max_tokens}
         data = self._post("generate", payload, timeout)

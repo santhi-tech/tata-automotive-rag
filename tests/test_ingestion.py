@@ -2,6 +2,8 @@ import pytest
 from ingestion.metadata.metadata_store import MetadataStore
 from ingestion.normalization.document_normalizer import NormalizedDocument
 
+pytestmark = pytest.mark.integration
+
 @pytest.mark.asyncio
 async def test_init_db():
     store = MetadataStore()

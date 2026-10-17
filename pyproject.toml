@@ -21,6 +21,7 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
+markers = ["integration: needs a running PostgreSQL (pgvector) and/or Ollama; skipped in CI"]
 
 [dependency-groups]
 dev = [

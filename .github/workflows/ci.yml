@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies from uv.lock
+        run: uv sync --frozen
+
+      - name: Compile sources
+        run: uv run python -m compileall -q src
+
+      # PostgreSQL and Ollama are not available on the runner; integration tests run locally.
+      - name: Run offline tests
+        run: uv run pytest -m "not integration" -q

@@ -11,9 +11,9 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.logger import setup_logger
-from serving.api.deps import get_conn
-from serving.api.v1.auth import router as auth_router
-from serving.api.v1.routes import router as v1_router
+from api.deps import get_conn
+from api.v1.auth import router as auth_router
+from api.v1.routes import router as v1_router
 
 logger = setup_logger(__name__)
 

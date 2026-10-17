@@ -1,4 +1,8 @@
+import pytest
+
 from retrieval.retriever import get_embedding
+
+pytestmark = pytest.mark.integration
 
 def test_embedding_length():
     emb = get_embedding("Electric cars are the future.")

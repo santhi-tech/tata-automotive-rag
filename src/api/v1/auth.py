@@ -4,7 +4,7 @@ from __future__ import annotations
 import bcrypt
 from fastapi import APIRouter, HTTPException, status
 
-from serving.api.deps import SignupRequest, TokenResponse, create_token, get_conn
+from api.deps import SignupRequest, TokenResponse, create_token, get_conn
 
 router = APIRouter()
 
