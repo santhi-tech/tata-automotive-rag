@@ -96,7 +96,7 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
 | Scheduled / incremental re-ingestion | 🗺️ Planned | Ingestion is a manual `python -m ingestion.pipeline` run |
 | Evaluation harness (retrieval and answer quality) | 🗺️ Planned | `tests/evaluation.py` is a 2-case smoke script, not a harness |
-| CI/CD | 🗺️ Planned | No pipeline configured |
+| CI/CD | 🚧 In Progress | GitHub actions configured |
 
 ---
 
