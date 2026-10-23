@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -13,21 +12,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.logger import setup_logger
-from retrieval.retriever import SUPPORTED_LANGUAGES, parse_metadata, product_name, retrieve_with_sources
+from retrieval.retriever import SUPPORTED_LANGUAGES, own_image, parse_metadata, product_name, retrieve_with_sources
 
 logger = setup_logger(__name__)
 
 
 def row_value(row: Any, field: str, default: Any = None) -> Any:
     return row[field] if field in row.keys() else default
-
-
-def product_image(metadata: dict[str, Any], shared: Counter[str]) -> str | None:
-    for image in metadata.get("images") or []:
-        path = image.get("local_path")
-        if path and Path(path).exists() and shared[path] == 1:
-            return path
-    return None
 
 
 def render_sources(rows: list[Any]) -> None:
@@ -44,15 +35,12 @@ def render_sources(rows: list[Any]) -> None:
 def render_product_cards(rows: list[Any]) -> None:
     if not rows:
         return
-    metadatas = [parse_metadata(row_value(row, "metadata", {})) for row in rows]
-    shared: Counter[str] = Counter(
-        str(image.get("local_path")) for metadata in metadatas for image in metadata.get("images") or [] if image.get("local_path")
-    )
     cols = st.columns(min(len(rows), 3))
-    for i, (row, metadata) in enumerate(zip(rows, metadatas)):
+    for i, row in enumerate(rows):
+        metadata = parse_metadata(row_value(row, "metadata", {}))
         name = product_name(metadata) or row_value(row, "chunk_id", "")
         with cols[i % len(cols)]:
-            image = product_image(metadata, shared)
+            image = own_image(metadata)
             if image:
                 st.image(image, caption=str(name))
             else:

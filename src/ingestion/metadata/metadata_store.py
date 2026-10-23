@@ -10,7 +10,7 @@ import asyncpg
 
 from config.logger import setup_logger
 from config.settings import DB_PARAMS, EMBEDDING_DIM, VECTOR_OPCLASS
-from ingestion.normalization.document_normalizer import METADATA_VERSION, NormalizedDocument, build_metadata
+from ingestion.normalization.document_normalizer import NormalizedDocument, build_metadata
 
 logger = setup_logger(__name__)
 
@@ -37,6 +37,14 @@ def _connection_params() -> dict[str, Any]:
     return dict(DB_PARAMS)
  
  
+def parse_version(raw: str | None) -> tuple[int, int]:
+    """'v4.1' -> (4, 1); compared as numbers, so v10.0 > v9.0 (text MAX gets that wrong)."""
+    parts = (raw or "").lstrip("v").split(".")
+    major = int(parts[0]) if parts[0].isdigit() else 0
+    minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return (major, minor)
+
+
 class MetadataStore:
     def __init__(self) -> None:
         self.pool: asyncpg.Pool | None = None
@@ -128,22 +136,17 @@ class MetadataStore:
             logger.warning("HNSW unavailable (%s); using exact scans", exc)
  
     async def _current_version(self) -> tuple[int, int]:
-        """Parse the highest metadata_version — checks chunks first, falls back to ingestion_meta table."""
+        """Highest version handed out so far: the ingestion_meta counter or any stamped chunk, compared numerically.
+        A number is never reused, even when a run's rows were later truncated."""
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ingestion_meta (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL
                 )
             """)
-            raw = await conn.fetchval("SELECT MAX(metadata->>'metadata_version') FROM brochure_chunks")
-            if not raw:
-                raw = await conn.fetchval("SELECT value FROM ingestion_meta WHERE key = 'metadata_version'")
-        if not raw:
-            return (0, 0)
-        parts = raw.replace("v", "").split(".")
-        major = int(parts[0]) if parts[0].isdigit() else 0
-        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-        return (major, minor)
+            stamped = await conn.fetch("SELECT DISTINCT metadata_version FROM brochure_chunks")
+            counter = await conn.fetchval("SELECT value FROM ingestion_meta WHERE key = 'metadata_version'")
+        return max([parse_version(r["metadata_version"]) for r in stamped] + [parse_version(counter)])
 
     async def next_metadata_version(self, *, reset: bool = False) -> str:
         """reset=True → major+1.0 (e.g. v3.0→v4.0), reset=False → major.minor+1 (e.g. v3.0→v3.1)."""
@@ -170,7 +173,7 @@ class MetadataStore:
         return version
  
     # -- writing ----------------------------------------------------------------------------------
-    async def upsert_documents(self, docs: list[NormalizedDocument], run_id: str) -> tuple[int, int]:
+    async def upsert_documents(self, docs: list[NormalizedDocument], run_id: str, version: str) -> tuple[int, int]:
         """Upsert one chunk (+ its image rows) per document. Each runs in its own savepoint: a bad row is
         logged and skipped. Returns (chunks stored, images stored)."""
         stored = image_count = 0
@@ -180,7 +183,7 @@ class MetadataStore:
                 for doc in docs:
                     try:
                         async with conn.transaction():  # nested -> SAVEPOINT
-                            image_count += await self._upsert_document(conn, doc, run_id, now)
+                            image_count += await self._upsert_document(conn, doc, run_id, now, version)
                         stored += 1
                     except (asyncpg.PostgresError, ValueError) as exc:
                         logger.error("Insert failed | doc=%s | %s: %s", doc.document_id, type(exc).__name__, exc)
@@ -188,7 +191,7 @@ class MetadataStore:
 
     @staticmethod
     async def _upsert_document(
-        conn: asyncpg.Connection, doc: NormalizedDocument, run_id: str, now: datetime.datetime
+        conn: asyncpg.Connection, doc: NormalizedDocument, run_id: str, now: datetime.datetime, version: str
     ) -> int:
         chunk_id = f"{doc.category}_{doc.document_id}_0"
         content_hash = hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
@@ -197,7 +200,7 @@ class MetadataStore:
             **build_metadata(doc),
             "document_id": doc.document_id, "chunk_id": chunk_id, "chunk_index": 0, "run_id": run_id,
             "content_hash": content_hash, "token_count": token_count, "ingestion_timestamp": now.isoformat(),
-            "metadata_version": METADATA_VERSION, "category": doc.category,
+            "metadata_version": version, "category": doc.category,
         }
         await conn.execute(
             """
@@ -212,7 +215,7 @@ class MetadataStore:
                 metadata = EXCLUDED.metadata, text_embedding = EXCLUDED.text_embedding
             """,
             chunk_id, doc.document_id, run_id, 0, doc.text, content_hash, token_count, now,
-            METADATA_VERSION, doc.category, json.dumps(meta, default=str), to_pgvector(doc.text_embedding),
+            version, doc.category, json.dumps(meta, default=str), to_pgvector(doc.text_embedding),
         )
         await conn.execute("DELETE FROM brochure_images WHERE chunk_id = $1", chunk_id)  # re-runs replace, not append
         for image in doc.images:

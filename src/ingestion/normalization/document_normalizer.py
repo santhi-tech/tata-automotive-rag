@@ -30,12 +30,6 @@ from ingestion.normalization.attributes import (
 
 logger = setup_logger(__name__)
 
-METADATA_VERSION = "v2.0"
-
-
-def set_metadata_version(version: str) -> None:
-    global METADATA_VERSION
-    METADATA_VERSION = version
 _SOURCE_TYPE = {"cars": "pdf_brochure", "motorcycles": "web_product_page", "scooters": "web_product_page", "spare_parts": "spare_part"}
 
 

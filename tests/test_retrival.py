@@ -115,8 +115,73 @@ async def test_general_question_gets_an_overview_without_products(monkeypatch):
 
 def test_home_page_is_not_a_product_and_shared_price_is_hidden_from_the_model():
     assert retriever.name_words(HERO_POOL[0]) == set()
-    context = product_context("price of destini", HERO_POOL[1:])
+    context = product_context("price of destini", HERO_POOL[1:], HERO_POOL[1:])
     assert "₹ 1,72,524" not in context and "Not reliable" in context
+
+
+def test_typos_in_category_and_product_names_still_resolve():
+    assert retriever.categories_in("Can you share the price of glomarous motocycles") == ["motorcycles"]
+    assert retriever.categories_in("cheapest scootors") == ["scooters"]
+    assert retriever.categories_in("can you share the price") == []
+    assert [r["text"] for r in named_products("price of destiny scooter", HERO_POOL)] == ["Destini India"]
+    prime = [{"metadata": {"product_url": "https://www.heromotocorp.com/en-in/buy-now/destini-prime.html"}, "text": "p"}]
+    assert named_products("Can you share the price of glomarous motocycles", prime) == []  # "price" must not fuzz into "prime"
+
+
+def test_shared_price_is_caught_even_when_one_product_is_left():
+    pool = [
+        {"metadata": {"model": "Destini Prime", "price": "₹ 1,72,524"}, "text": "a"},
+        {"metadata": {"model": "Glamour X", "price": "₹ 1,72,524"}, "text": "b"},
+    ]
+    answer = retriever.format_product_answer("price of destini prime", pool[:1], as_table=False, price_rows=pool)
+    assert "₹" not in answer and answer.startswith("No reliable price is indexed for Destini Prime.")
+
+
+def test_price_question_without_a_price_answers_in_two_lines_with_links():
+    rows = [
+        {"metadata": {"product_url": "https://www.heromotocorp.com/en-in/buy-now/glamour-x.html", "price": "₹ 1,72,524"}, "text": "g"},
+        {"metadata": {"product_url": "https://www.heromotocorp.com/en-in/buy-now/glamour-x-abs.html", "price": "₹ 1,72,524"}, "text": "a"},
+    ]
+    answer = retriever.format_product_answer("price of glamour", rows, as_table=False, price_rows=rows)
+    assert answer.splitlines() == [
+        "No reliable price is indexed for Glamour X, Glamour X Abs.",
+        "See the product page for the current price and details: "
+        "[Glamour X](https://www.heromotocorp.com/en-in/buy-now/glamour-x.html), "
+        "[Glamour X Abs](https://www.heromotocorp.com/en-in/buy-now/glamour-x-abs.html)",
+    ]
+
+
+def test_only_images_named_after_the_product_are_shown(tmp_path):
+    site, own = tmp_path / "xoom-160_2ad64bdc.jpg", tmp_path / "2830akag900s-a_2475601f.jpeg"
+    site.write_bytes(b"x")
+    own.write_bytes(b"x")
+    glamour = {"product_url": "https://www.heromotocorp.com/en-in/buy-now/glamour-x.html", "images": [{"local_path": str(site)}]}
+    kicklever = {"model": "Kicklever Assembly - Splendor+ - 2830AKAG900S", "images": [{"local_path": str(site)}, {"local_path": str(own)}]}
+    assert retriever.own_image(glamour) is None
+    assert retriever.own_image(kicklever) == str(own)
+
+
+def test_details_paragraph_uses_only_stored_fields_and_skips_empty_pages():
+    car = {"metadata": {
+        "model": "Altroz", "product_url": "https://tata.cars/altroz/ice.html", "price": "Starting from ₹5,99,990*",
+        "description": "Explore the Tata Altroz starting from ₹5.99 Lakh* featuring petrol & diesel engines. Explore features & book now!",
+        "features": ["5 star BNCAP safety rating", "6 airbags as standard", "LED"], "color_variants": ["Pristine White", "Royal Blue"],
+    }, "text": "a"}
+    paragraph = retriever.product_paragraph(car, [car])
+    assert paragraph == (
+        "**Altroz**: Explore the Tata Altroz featuring petrol & diesel engines. "
+        "Key features include 5 star BNCAP safety rating; 6 airbags as standard. "
+        "It is listed in Pristine White, Royal Blue. The indexed starting price is ₹5,99,990. "
+        "Full details: [Altroz](https://tata.cars/altroz/ice.html)."
+    )
+    assert retriever.product_paragraph(HERO_POOL[1], HERO_POOL) == ""  # Hero page stored no description/features
+
+
+def test_metadata_versions_compare_as_numbers():
+    from ingestion.metadata.metadata_store import parse_version
+
+    assert parse_version("v10.0") > parse_version("v9.3") > parse_version("v4.0") > parse_version(None) == (0, 0)
+    assert max(["v2.0", "v10.0", "v4.1"], key=parse_version) == "v10.0"
 
 
 def test_needs_translation_only_for_non_english_questions():
@@ -161,7 +226,7 @@ def test_feature_table_links_price_colours_and_features():
         "color_variants": ["Pristine White", "Royal Blue"],
         "features": ["6 airbags", "5 star BNCAP", "LED fog lamps", "ESP", "SOS calling"],
     }}]
-    table = feature_table(rows)
+    table = feature_table(rows, rows)
     assert "[Altroz](https://tata.cars/altroz/ice.html)" in table
     assert "| ₹5,99,990 |" in table
     assert "Pristine White, Royal Blue" in table
@@ -184,7 +249,7 @@ def test_feature_question_lists_only_products_that_mention_it():
 def test_product_context_stays_small_per_product():
     long_text = "Sunroof detail. " * 2000
     rows = [{"metadata": {"model": f"Model {i}", "features": ["x" * 500] * 10}, "text": long_text} for i in range(5)]
-    assert all(len(block) <= 800 for block in product_context("Which SUV has a sunroof?", rows).split("\n\n") if block)
+    assert all(len(block) <= 800 for block in product_context("Which SUV has a sunroof?", rows, rows).split("\n\n") if block)
 
 
 def test_unindexed_products_flags_models_missing_from_context():

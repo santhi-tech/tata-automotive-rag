@@ -75,10 +75,6 @@ class BaseLoader:
         return clean.rstrip("/") or clean
 
     @staticmethod
-    def _same_host(url_a: str, url_b: str) -> bool:
-        return urlparse(url_a).netloc.lower() == urlparse(url_b).netloc.lower()
-
-    @staticmethod
     def _safe_filename(value: str, default: str = "image") -> str:
         value = os.path.basename(value).split("?")[0].strip()
         if not value:

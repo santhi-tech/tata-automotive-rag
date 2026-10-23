@@ -19,7 +19,7 @@ from ingestion.embedding.embedder import Embedder
 from ingestion.images import PersistentImageStore
 from ingestion.loader.loader import LOADERS
 from ingestion.metadata.metadata_store import MetadataStore
-from ingestion.normalization.document_normalizer import NormalizedDocument, normalize_document, set_metadata_version
+from ingestion.normalization.document_normalizer import NormalizedDocument, normalize_document
 
 logger = setup_logger(__name__)
 
@@ -50,7 +50,6 @@ async def run_ingestion(categories: list[str] | None = None, *, reset: bool = Fa
             version = await store.reset()
         else:
             version = await store.next_metadata_version()
-        set_metadata_version(version)
         logger.info("[Ingestion] metadata_version=%s", version)
         for category in categories or LOADERS:
             logger.info("[Ingestion] category=%s run=%s", category, run_id)
@@ -70,7 +69,7 @@ async def run_ingestion(categories: list[str] | None = None, *, reset: bool = Fa
                 await asyncio.to_thread(_embed_missing, embedder, doc)
                 accepted.append(doc)
 
-            chunks, images = await store.upsert_documents(accepted, run_id)
+            chunks, images = await store.upsert_documents(accepted, run_id, version)
             logger.info("[Ingestion] stored category=%s chunks=%d images=%d", category, chunks, images)
         await store._save_version(version)
     finally:

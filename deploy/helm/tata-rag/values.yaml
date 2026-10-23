@@ -1,0 +1,45 @@
+image:
+  repository: ghcr.io/santhi-tech/tata-automotive-rag
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Secret you create yourself (never commit it). Required keys: POSTGRES_USER, POSTGRES_PASSWORD, JWT_SECRET.
+#   kubectl create secret generic tata-rag-secrets --from-literal=POSTGRES_USER=... \
+#     --from-literal=POSTGRES_PASSWORD=... --from-literal=JWT_SECRET="$(openssl rand -hex 32)"
+existingSecret: tata-rag-secrets
+
+# Non-secret settings, injected into every pod as environment variables (see README "Configuration Reference").
+# PostgreSQL (with pgvector) and Ollama run outside this chart.
+env:
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: tata_rag
+  OLLAMA_HOST: http://ollama:11434
+  GENERATION_MODEL: qwen2.5:1.5b
+  MULTILINGUAL_MODEL: qwen3:8b
+  EMBEDDING_MODEL: nomic-embed-text:latest
+  VISION_MODEL: llava:latest
+  IMAGE_DATA_DIR: /data
+
+api:
+  replicas: 2
+  port: 8000
+  resources: {}
+
+ui:
+  replicas: 1
+  port: 8501
+  resources: {}
+
+ingestion:
+  schedule: "0 2 * * *"   # daily 02:00 UTC
+  # Incremental by default: a new minor version, rows upserted per product. Never put --reset on a schedule:
+  # it truncates the index first. Run resets as a one-off Job (README "AI Platform and Deployment").
+  args: []
+  activeDeadlineSeconds: 21600   # 6 h; a hung crawl is killed instead of blocking the next run
+  resources: {}
+
+# Ingestion writes product images here and the UI reads them, so the volume must be ReadWriteMany.
+storage:
+  size: 10Gi
+  storageClassName: ""

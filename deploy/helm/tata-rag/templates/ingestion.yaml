@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-ingestion
+spec:
+  schedule: {{ .Values.ingestion.schedule | quote }}
+  concurrencyPolicy: Forbid   # two crawls at once would race on the same rows and the version counter
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: {{ .Values.ingestion.activeDeadlineSeconds }}
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: ingestion
+              {{- include "tata-rag.container" . | nindent 14 }}
+              command: ["python", "-m", "ingestion.pipeline"]
+              args: {{ toJson .Values.ingestion.args }}
+              volumeMounts:
+                - name: data
+                  mountPath: {{ .Values.env.IMAGE_DATA_DIR }}
+                - name: dshm
+                  mountPath: /dev/shm
+              resources: {{- toYaml .Values.ingestion.resources | nindent 16 }}
+          volumes:
+            {{- include "tata-rag.dataVolume" . | nindent 12 }}
+            # Chromium crashes on the default 64 MiB /dev/shm in containers
+            - name: dshm
+              emptyDir: {medium: Memory, sizeLimit: 1Gi}

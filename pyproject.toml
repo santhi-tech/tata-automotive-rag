@@ -8,7 +8,6 @@ dependencies = [
     "aiohttp",
     "playwright",
     "pillow",
-    "pytesseract",
     "asyncpg",
     "requests>=2.34.2",
     "dotenv>=0.9.9",

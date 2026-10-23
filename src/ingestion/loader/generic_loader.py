@@ -155,7 +155,7 @@ class GenericVehicleLoader(BaseLoader):
     # URL DISCOVERY
     # ============================================================
 
-    def _is_candidate_product_url(self, source_url: str, candidate_url: str, link_text: str = "") -> bool:
+    def _is_candidate_product_url(self, source_url: str, candidate_url: str) -> bool:
 
         source = self._normalize_url(source_url)
 
@@ -176,8 +176,6 @@ class GenericVehicleLoader(BaseLoader):
 
         path = candidate_parsed.path.lower().rstrip("/")
 
-        text = " ".join((link_text or "").lower().split())
-
         if not path:
             return False
 
@@ -187,54 +185,10 @@ class GenericVehicleLoader(BaseLoader):
         if path.endswith((".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".zip", ".mp4")):
             return False
 
-        # --------------------------------------------------------
-        # Category-specific URL rules
-        # --------------------------------------------------------
-
-        if self.CATEGORY == "cars":
-            if any(marker in path for marker in ("/cars/", "/car/", "/suv/", "/vehicles/", "/models/", "/products/")):
-                return True
-
-        elif self.CATEGORY in {"motorcycles", "scooters", "sports_bikes"}:
-            if any(
-                marker in path
-                for marker in (
-                    "/motorcycles/",
-                    "/motorcycle/",
-                    "/scooters/",
-                    "/scooter/",
-                    "/bikes/",
-                    "/bike/",
-                    "/products/",
-                    "/product/",
-                    "/models/",
-                )
-            ):
-                return True
-
-        # --------------------------------------------------------
-        # Link-text fallback
-        # --------------------------------------------------------
-
-        product_terms = (
-            "explore",
-            "view details",
-            "view product",
-            "know more",
-            "learn more",
-            "buy now",
-            "vehicle",
-            "motorcycle",
-            "scooter",
-            "bike",
-            "suv",
-            "sedan",
-        )
-
-        if any(term in text for term in product_terms):
-            return True
-
-        return False
+        # Hero files each model under its own category (/en-in/scooters/xoom.html). /buy-now/ pages are
+        # category-neutral booking forms linked from the site-wide menu: accepting them (or the other category's
+        # path, or any "BUY NOW" link text) is how scooters were stored as motorcycles.
+        return f"/{self.CATEGORY}/" in path and "/buy-now/" not in path and "test-ride" not in path
 
     async def discover_product_links(self, page: Page, source: Dict[str, Any]) -> List[str]:
         source_url = source["url"]
@@ -267,9 +221,9 @@ class GenericVehicleLoader(BaseLoader):
                 href = self._normalize_url(item.get("href", ""))
 
                 if self._is_candidate_product_url(
-                    source_url=source_url, candidate_url=href, link_text=item.get("text", "")
+                    source_url=source_url, candidate_url=href
                 ):
-                    links.add(href)
+                    links.add(href.split("?", 1)[0])  # ?tab=… variants are the same page; the scraper never switches tabs
 
         except PlaywrightTimeoutError:
             logger.exception("Discovery timeout | %s", source_url)

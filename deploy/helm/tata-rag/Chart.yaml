@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tata-rag
+description: Tata Automotive RAG - FastAPI backend, Streamlit UI and scheduled ingestion from one image
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

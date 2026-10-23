@@ -5,7 +5,7 @@
 A retrieval-augmented generation (RAG) platform that ingests automotive knowledge from heterogeneous sources (dynamic web pages, product images) into one canonical document model, indexes it in PostgreSQL + pgvector, and serves category-scoped, grounded answers through a local LLM (Ollama).
 
 
-**Author:** **Santhi Bhogavalli** — AI Engineer | GenAI & RAG | Senior DevOps
+**Author:** **Santhi Bhogavalli** — AI Platform | AI Engineer | GenAI & RAG | Senior DevOps
 
 ## Table of Contents
 
@@ -26,10 +26,11 @@ A retrieval-augmented generation (RAG) platform that ingests automotive knowledg
 15. [Configuration Reference](#configuration-reference)
 16. [Example Prompts](#example-prompts)
 17. [REST API](#rest-api)
-18. [Running Tests](#running-tests)
-19. [Roadmap](#roadmap)
-20. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
-21. [Author](#author)
+18. [AI Platform and Deployment](#ai-platform-and-deployment)
+19. [Running Tests](#running-tests)
+20. [Roadmap](#roadmap)
+21. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
+22. [Author](#author)
 
 ---
 
@@ -89,14 +90,15 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Question-driven category detection ("All" categories selected) | ✅ Implemented | Keyword match (`CATEGORY_TERMS`), falling back to the top match's own category |
 | Image vector search at query time | ✅ Implemented | `search_images_for_query`, same category scoping as text |
 | HNSW vector indexes | ✅ Implemented | `MetadataStore._ensure_indexes`; falls back to exact scan on pgvector < 0.5 |
-| Containerized ingestion | ✅ Implemented | `Dockerfile` (Chromium + Playwright deps baked in) |
+| Containerized UI, API and ingestion | ✅ Implemented | One `Dockerfile` image (Chromium + Playwright deps baked in), three roles chosen by command |
+| Kubernetes deployment (Helm) | ✅ Implemented | `deploy/helm/tata-rag`: API and UI Deployments + Services, ingestion CronJob, ConfigMap, shared image volume. See [AI Platform and Deployment](#ai-platform-and-deployment) |
 | Automotive-only scope | ✅ Implemented | `is_automotive()` refuses questions that name no indexed product and use no automotive term (e.g. "What is the capital of India?"). The refusal is fixed text per language, so no model call is made and nothing is generated from general knowledge |
 | Query understanding: intent and product entities | ✅ Implemented | `retriever.py::understand_query` labels intents (comparison, price, table, colour, spec, general) and matches product names against retrieved rows; rule-based, not an LLM classifier |
 | Keyword search (BM25) + score fusion (RRF) | ✅ Implemented | `search_keywords()` via PostgreSQL tsvector; fused with vector results via RRF in `search_in_category()` |
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
-| Scheduled / incremental re-ingestion | 🗺️ Planned | Ingestion is a manual `python -m ingestion.pipeline` run |
+| Scheduled / incremental re-ingestion | ✅ Implemented | Kubernetes CronJob (daily 02:00 UTC by default), incremental runs, no overlapping runs; `--reset` only as a one-off Job |
 | Evaluation harness (retrieval and answer quality) | 🗺️ Planned | `tests/evaluation.py` is a 2-case smoke script, not a harness |
-| CI/CD | 🚧 In Progress | GitHub actions configured |
+| CI/CD | 🚧 In Progress | CI: offline tests, Helm lint/render, image build + push to GHCR on `main`. CD (`helm upgrade` to a cluster) is still manual |
 
 ---
 
@@ -177,9 +179,11 @@ Runs per request and is latency-sensitive: each text query makes at most one Oll
 
 ```
 tata-automotive-rag/
-├── Dockerfile
+├── Dockerfile                       # one image for UI, API and ingestion
+├── .github/workflows/ci.yml         # tests, Helm lint/render, image push to GHCR
+├── deploy/helm/tata-rag/            # Helm chart: api, ui, ingestion CronJob, config, shared volume
 ├── pyproject.toml / uv.lock
-├── main.py                          # launches the Streamlit app
+├── main.py                          # local dev: Streamlit (8501) + API (8000) in one command
 ├── src/
 │   ├── config/
 │   │   ├── logger.py                 # setup_logger(): one timestamped stdout handler per name
@@ -191,7 +195,7 @@ tata-automotive-rag/
 │   │   │   ├── generic_loader.py     # GenericVehicleLoader: discovery + extraction shared by 3 categories
 │   │   │   ├── cars_loader.py        # CarsLoader: bespoke discovery for tata.cars
 │   │   │   ├── motorcycles_loader.py # MotorcyclesLoader(GenericVehicleLoader)
-│   │   │   ├── scooters_loader.py    # ScootersLoader(BaseLoader)
+│   │   │   ├── scooters_loader.py    # ScootersLoader(GenericVehicleLoader)
 │   │   │   ├── spare_parts_loader.py # SparePartsLoader(BaseLoader)
 │   │   │   └── loader.py             # LOADERS: category name -> loader class
 │   │   ├── embedding/embedder.py     # Embedder: Ollama client (embed_text, generate_text, describe_image, embed_image)
@@ -277,7 +281,6 @@ Text and image embeddings therefore live in the **same embedding space** (both a
 | **Playwright** | Renders JavaScript-heavy pages and drives discovery/extraction |
 | **aiohttp** | Async image downloads |
 | **Pillow** | Re-encodes images to JPEG before sending to Ollama's vision model |
-| **pytesseract** | Installed; not currently wired into the normalized document (no `ocr_text` producer in the loaders) |
 | **Ollama** (`llava` for vision, `nomic-embed-text` for embeddings, `qwen2.5:1.5b` for multilingual generation) | All three model roles, served locally |
 
 ---
@@ -401,7 +404,7 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
 | Storage | PostgreSQL + pgvector (HNSW) |
 | LLM app | Ollama — `nomic-embed-text` (embeddings), `llava` (vision), `qwen2.5:1.5b` (multilingual generation) |
 | UI | Streamlit |
-| Containerization | Docker (ingestion image, Playwright/Chromium preinstalled) |
+| Containerization / platform | Docker (one image, Playwright/Chromium preinstalled), Kubernetes + Helm, GHCR |
 | Testing | pytest + pytest-asyncio |
 
 ---
@@ -448,14 +451,18 @@ python main.py
 cd src && streamlit run app/ui_streamlit.py
 ```
 
-### Docker (ingestion only)
+### Docker
+
+One image serves all three roles; the command picks the role (default: ingestion).
 
 ```bash
-docker build -t tata-rag-ingest .
-docker run --rm --env-file .env --network host tata-rag-ingest
+docker build -t tata-rag .
+docker run --rm --env-file .env --network host tata-rag                                   # ingestion
+docker run --rm --env-file .env --network host tata-rag python -m uvicorn api:app --app-dir /app/src --host 0.0.0.0
+docker run --rm --env-file .env --network host tata-rag python -m streamlit run /app/src/app/ui_streamlit.py
 ```
 
-The image bundles Chromium + its OS dependencies; it needs network access to your PostgreSQL and Ollama hosts (`--network host` is the simplest way on Linux — on Windows/Mac, point `POSTGRES_HOST`/`OLLAMA_HOST` at `host.docker.internal`).
+The image bundles Chromium + its OS dependencies; it needs network access to your PostgreSQL and Ollama hosts (`--network host` is the simplest way on Linux — on Windows/Mac, point `POSTGRES_HOST`/`OLLAMA_HOST` at `host.docker.internal`). `.dockerignore` keeps `.env`, `.venv`, `data/` and `.git` out of the build context.
 
 ---
 
@@ -482,7 +489,6 @@ All settings are environment variables (or `.env`); every one has a working defa
 | `{CATEGORY}_VISION_TIMEOUT_SECONDS` | `90` (`120` for cars) | Raise on CPU-only Ollama hosts |
 | `{CATEGORY}_EMBED_TIMEOUT_SECONDS` | `30` (`120` for cars) | |
 | `CARS_MAX_IMAGE_BYTES` | `10 MiB` | Per-image download cap for the cars loader |
-| `LOG_LEVEL` | `INFO` | Only read by `ingestion/loader/loader.py`'s standalone `__main__` |
 
 A `cars` loader example that disables vision for a fast text-only test run:
 
@@ -605,6 +611,92 @@ User accounts are stored in PostgreSQL (`api_users` table, created automatically
 
 ---
 
+## AI Platform and Deployment
+
+### Platform view
+
+```mermaid
+flowchart LR
+    GH["GitHub Actions<br/>tests · helm lint · image build"] -->|push on main| REG["GHCR image<br/>tata-automotive-rag:&lt;sha&gt;"]
+    REG --> API & UI & ING
+    subgraph K8S["Kubernetes (Helm release: deploy/helm/tata-rag)"]
+        API["Deployment: api<br/>FastAPI · 2 replicas · :8000"]
+        UI["Deployment: ui<br/>Streamlit · :8501"]
+        ING["CronJob: ingestion<br/>daily, concurrencyPolicy: Forbid"]
+        PVC[("PVC data · ReadWriteMany<br/>product images")]
+        ING -->|writes images| PVC
+        UI -->|reads images| PVC
+    end
+    PG[("PostgreSQL + pgvector<br/>external / managed")]
+    OL["Ollama<br/>external, GPU node recommended"]
+    API & UI & ING --> PG
+    API & UI & ING --> OL
+```
+
+One image runs all three roles: the API, the UI and ingestion differ only in their container command. PostgreSQL (with `pgvector`) and Ollama are not part of the chart. In production they are usually a managed database and a GPU-backed model server, owned separately from the app.
+
+### Why ingestion runs as a Kubernetes CronJob
+
+Ingestion is a bounded batch: crawl, normalise, embed, upsert, then exit. It doesn't need to run continuously; it needs to run on a schedule, one run at a time, with a time limit. That is exactly what a CronJob provides:
+
+| Concern | How the chart handles it |
+|---|---|
+| Two runs at once racing on the same rows and version counter | `concurrencyPolicy: Forbid`: a run that is still going makes the next schedule skip |
+| A hung crawl (site change, Playwright stall) | `activeDeadlineSeconds: 21600` kills it after 6 h; `backoffLimit: 1` retries once |
+| Wiping the index by accident | Scheduled runs are incremental (new minor version, rows upserted per product). `--reset` is only ever run as a one-off Job |
+| A failed run hurting answers | Every run stamps its rows with a version; retrieval searches the newest version and falls back to older rows only when the newest has nothing usable |
+| Chromium crashing in a container | `/dev/shm` is mounted as a 1 GiB in-memory volume |
+
+Alternatives, and when to switch:
+
+| Pattern | Use it when |
+|---|---|
+| **Kubernetes CronJob** (current) | One pipeline, one schedule, a handful of sources |
+| Airflow / Argo Workflows | Ingestion grows into a DAG: per-category steps with their own retries, backfills, validation gates before publishing a version |
+| Event-driven queue (one message per product URL) | Sources change often and need near-real-time freshness, or crawling must scale out across many workers |
+| Always-on worker | Not recommended here: it holds memory and a browser between runs for no benefit |
+
+### Deploy
+
+```bash
+# 1. Image: CI pushes ghcr.io/<owner>/tata-automotive-rag:<sha> on every push to main.
+# 2. Secret (never committed):
+kubectl create secret generic tata-rag-secrets \
+  --from-literal=POSTGRES_USER=... --from-literal=POSTGRES_PASSWORD=... \
+  --from-literal=JWT_SECRET="$(openssl rand -hex 32)"
+
+# 3. Install or upgrade (pin the image to a commit, not latest):
+helm upgrade --install tata-rag deploy/helm/tata-rag \
+  --set image.tag=<git-sha> \
+  --set env.POSTGRES_HOST=<db-host> --set env.OLLAMA_HOST=http://<ollama-host>:11434 \
+  --set storage.storageClassName=<a ReadWriteMany class, e.g. efs-sc / azurefile>
+
+# 4. Reach the services (add an Ingress + TLS for real traffic):
+kubectl port-forward svc/tata-rag-ui 8501:8501
+kubectl port-forward svc/tata-rag-api 8000:8000
+```
+
+### Operate ingestion
+
+```bash
+kubectl create job ingest-now --from=cronjob/tata-rag-ingestion              # run now, incremental
+kubectl create job ingest-reset --from=cronjob/tata-rag-ingestion --dry-run=client -o json \
+  | jq '.spec.template.spec.containers[0].args = ["--reset"]' | kubectl apply -f -   # full rebuild, new major version
+kubectl logs -f job/ingest-now
+```
+
+`ingestion.args` in `values.yaml` scopes scheduled runs (for example `["--categories", "cars"]`). Keep `--reset` out of it.
+
+### Not in the chart yet
+
+- **Ingress and TLS** for the UI and API.
+- **Resource requests and limits.** `resources: {}` is a placeholder until real usage is measured. Ingestion with vision needs the most memory.
+- **Autoscaling (HPA)** for the API.
+- **Version retention.** Old versions are not deleted yet. The production pattern is to delete them only after a new version passes a validation check (row counts per category), keeping one previous version for rollback.
+- **`JWT_SECRET` hardening.** It comes from the Secret here, but `api/deps.py` still falls back to a hard-coded value when it is unset. Make it required.
+
+---
+
 ## Running Tests
 
 ```bash
@@ -622,7 +714,7 @@ GitHub Actions (`.github/workflows/ci.yml`) installs from `uv.lock`, compiles `s
 
 **Near term**
 - ~~Query understanding beyond keyword category matching (entities, intent)~~ ✅ Rule-based version done; an LLM classifier is still open
-- Wire `pytesseract` OCR into the normalized document (installed but unused today)
+- OCR text for images (`ocr_text` has no producer; would need an OCR dependency such as `pytesseract`)
 - Scheduled / incremental re-ingestion with change detection
 
 **Retrieval quality**
@@ -631,8 +723,7 @@ GitHub Actions (`.github/workflows/ci.yml`) installs from `uv.lock`, compiles `s
 - A real retrieval/answer-quality evaluation harness (beyond the 2-case smoke script)
 
 **Platform**
-- CI/CD pipeline
-- Containerize the Streamlit app side (ingestion already has a `Dockerfile`)
+- Continuous deployment: `helm upgrade` from CI to a cluster (CI already builds and pushes the image)
 - Observability: structured metrics on top of the existing logging
 
 ---
