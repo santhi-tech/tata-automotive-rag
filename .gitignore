@@ -13,7 +13,16 @@ output.log
 # Ignore Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
-#claude.md
-CLAUDE.md
 #Ignore .ruff_cache 
 .ruff_cache/*
+
+# ignore __pycache__ folders
+__pycache__/
+
+#Ignore claude.md
+CLAUDE.md
+
+# Ignore interview-questions.md
+interview-questions.md
+
+#Ignore doc/*

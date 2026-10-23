@@ -48,6 +48,8 @@ This README describes both the current implementation and the intended "producti
 
 ## Overview
 
+> New to the code? [docs/how-it-works.md](docs/how-it-works.md) walks through every stage, from Playwright crawling to the answer, the UI and the API, with the file and function for each step.
+
 Automotive product knowledge is scattered across formats: JavaScript-rendered model pages, spec tables, pricing, and product imagery. The system is organized around a source-agnostic pipeline:
 
 ```
