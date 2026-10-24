@@ -61,7 +61,7 @@ jobs:
           else
             # Regular main push: use dev version from pyproject.toml + build number
             BASE_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
-            VERSION="${BASE_VERSION}+build.${{ github.run_number }}"
+            VERSION="${BASE_VERSION}-build.${{ github.run_number }}"
             IS_RELEASE="false"
           fi
 
@@ -100,7 +100,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.metadata.outputs.version }}
-            ${{ steps.metadata.outputs.is_release == 'true' && format('ghcr.io/{0}:latest', github.repository) || '' }}
+            ${{ steps.metadata.outputs.is_release == 'true' && format('ghcr.io/{0}:latest', github.repository) || format('') }}
           labels: |
             org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
