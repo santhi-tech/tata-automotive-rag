@@ -287,6 +287,42 @@ class GenericVehicleLoader(BaseLoader):
     # VEHICLE PAGE EXTRACTION
     # ============================================================
 
+    async def _get_product_container(self, page: Page) -> Optional[str]:
+        """Find the product-specific content container, skipping site-wide banners.
+        Hero pages have a top banner with shared content; actual product details are below."""
+        containers = [
+            "main",
+            "[role='main']",
+            "[class*='product-detail']",
+            "[class*='product-section']",
+            "[class*='vehicle-detail']",
+            "[id*='product']",
+        ]
+        for selector in containers:
+            count = await page.locator(selector).count()
+            if count > 0:
+                return selector
+        return None
+
+    async def _extract_from_container(self, page: Page, container_selector: Optional[str], selectors: List[str], timeout: int = 3000) -> str:
+        """Extract text from a specific container, or fall back to page-wide search."""
+        if container_selector:
+            for selector in selectors:
+                try:
+                    locator = page.locator(container_selector).locator(selector).first
+                    if await locator.count():
+                        value = (await locator.inner_text(timeout=timeout)).strip()
+                        if value and not self._is_navigation_text(value):
+                            return value
+                except Exception:
+                    continue
+        return await self._extract_first_text(page, selectors, timeout)
+
+    def _is_navigation_text(self, text: str) -> bool:
+        """Filter out banner/navigation text that appears on all pages."""
+        nav_indicators = ("select model", "buy now", "test ride", "add to cart", "explore", "shop now")
+        return any(phrase in text.lower() for phrase in nav_indicators)
+
     async def extract_product_page(self, page: Page, product_url: str, source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         try:
@@ -294,30 +330,36 @@ class GenericVehicleLoader(BaseLoader):
 
             await page.wait_for_timeout(1800)
 
-            title = await self._extract_first_text(
+            product_container = await self._get_product_container(page)
+
+            title = await self._extract_from_container(
                 page,
+                product_container,
                 [
                     "h1",
                     "[class*='vehicle-name']",
                     "[class*='product-title']",
                     "[class*='model-name']",
                     "[class*='vehicle-title']",
+                    "h2",
                 ],
             )
 
-            description = await self._extract_first_text(
+            description = await self._extract_from_container(
                 page,
+                product_container,
                 [
                     "[class*='description']",
                     "[class*='vehicle-description']",
                     "[class*='product-description']",
                     "[id*='description']",
                     "article",
+                    "p[class*='product']",
                 ],
             )
 
-            price = await self._extract_first_text(
-                page, ["[class*='price']", "[id*='price']", ".price", "[data-price]"]
+            price = await self._extract_from_container(
+                page, product_container, ["[class*='price']", "[id*='price']", ".price", "[data-price]"]
             )
 
             # ----------------------------------------------------
@@ -393,7 +435,7 @@ class GenericVehicleLoader(BaseLoader):
             # IMAGES
             # ----------------------------------------------------
 
-            images = await self._extract_images(page, product_url)
+            images = await self._extract_images(page, product_url, product_container)
 
             return {
                 "brand": source["brand"],
@@ -505,9 +547,11 @@ class GenericVehicleLoader(BaseLoader):
     # IMAGES
     # ============================================================
 
-    async def _extract_images(self, page: Page, product_url: str) -> List[Dict[str, Any]]:
+    async def _extract_images(self, page: Page, product_url: str, product_container: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Extract images, preferring product-specific container over whole page."""
+        selector = f"{product_container} img" if product_container else "img"
 
-        image_elements = await page.locator("img").evaluate_all(
+        image_elements = await page.locator(selector).evaluate_all(
             """
             images => images.map(img => ({
                 src:
