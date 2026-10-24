@@ -40,19 +40,61 @@ jobs:
     needs: [test, helm]
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag (release vs patch auto-increment)
+        id: tag
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          IS_RELEASE=$(echo "$COMMIT_MSG" | grep -iE "(release|merge pull request)" | wc -l)
+          BASE_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
+
+          if [ "$IS_RELEASE" -gt 0 ]; then
+            TAG="v${BASE_VERSION}"
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "is_release=true" >> $GITHUB_OUTPUT
+            echo "Release merge → $TAG"
+          else
+            LAST_TAG=$(git tag -l "v${BASE_VERSION%.*}.*" --sort=-version:refname | head -1)
+            if [ -z "$LAST_TAG" ]; then
+              PATCH=1
+            else
+              PATCH=$(echo "$LAST_TAG" | sed "s/.*\\.//" | xargs -I {} sh -c 'echo $(({}+1))')
+            fi
+            TAG="v${BASE_VERSION}.${PATCH}"
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "Regular commit → patch tag $TAG"
+          fi
+
+      - name: Create and push git tag
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          TAG="${{ steps.tag.outputs.tag }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists"
+          else
+            git tag -a "$TAG" -m "$TAG"
+            git push origin "$TAG"
+            echo "Created and pushed $TAG"
+          fi
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.PAT_GITHUB_TOKEN }}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag }}
             ghcr.io/${{ github.repository }}:latest
