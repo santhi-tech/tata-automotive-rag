@@ -1,6 +1,6 @@
 [project]
 name = "tata-automotive-rag"
-version = "v0.2.0"
+version = "0.2.0"
 description = "RAG pipeline for automotive product pages: Playwright ingestion, pgvector hybrid search, Ollama, FastAPI."
 readme = "README.md"
 requires-python = ">=3.12"
