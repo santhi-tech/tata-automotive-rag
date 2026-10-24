@@ -7,6 +7,8 @@ A retrieval-augmented generation (RAG) platform that ingests automotive knowledg
 
 **Author:** **Santhi Bhogavalli** — AI Platform | AI Engineer | GenAI & RAG | Senior DevOps
 
+📖 **[Read the article on Medium](https://medium.com/@shanthi.bhogavalli/grounded-answers-for-a-car-catalogue-building-a-multimodal-rag-system-that-runs-like-a-platform-15fac7a761fc)** — Deep dive into the architecture, design decisions, and lessons learned building this RAG system.
+
 ## Table of Contents
 
 1. [Status Legend](#status-legend)
