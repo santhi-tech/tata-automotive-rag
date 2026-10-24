@@ -93,7 +93,7 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Kubernetes deployment (Helm) | ✅ Implemented | `deploy/helm/tata-rag`: API and UI Deployments + Services, ingestion CronJob, ConfigMap, shared image volume. See [AI Platform and Deployment](#ai-platform-and-deployment) |
 | Automotive-only scope | ✅ Implemented | `is_automotive()` refuses questions that name no indexed product and use no automotive term (e.g. "What is the capital of India?"). The refusal is fixed text per language, so no model call is made and nothing is generated from general knowledge |
 | Query understanding: intent and product entities | ✅ Implemented | `retriever.py::understand_query` labels intents (comparison, price, table, colour, spec, general) and matches product names against retrieved rows; rule-based, not an LLM classifier |
-| Keyword search (BM25) + score fusion (RRF) | ✅ Implemented | `search_keywords()` via PostgreSQL tsvector; fused with vector results via RRF in `search_in_category()` |
+| Keyword search (ts_rank) + score fusion (RRF) | ✅ Implemented | `search_keywords()` via PostgreSQL tsvector + ts_rank (not BM25); fused with vector results via RRF in `search_in_category()` |
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
 | Scheduled / incremental re-ingestion | ✅ Implemented | Kubernetes CronJob (daily 02:00 UTC by default), incremental runs, no overlapping runs; `--reset` only as a one-off Job |
 | Evaluation harness (retrieval and answer quality) | 🗺️ Planned | `tests/evaluation.py` is a 2-case smoke script, not a harness |
@@ -392,7 +392,7 @@ unique_by(product_identity)  — one row per distinct product, ranked, capped at
 | Question-driven category keywords | ✅ Implemented (`CATEGORY_TERMS` in `retriever.py`) |
 | Structured product answers (no LLM round-trip) | ✅ Implemented |
 | Non-LLM fallback on Ollama timeout | ✅ Implemented |
-| BM25 / keyword search + RRF fusion | ✅ Implemented |
+| ts_rank keyword search + RRF fusion | ✅ Implemented |
 | Cross-encoder reranking | 🗺️ Planned |
 | Entity/intent-level query understanding (rule-based) | ✅ Implemented |
 
