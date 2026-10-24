@@ -97,7 +97,7 @@ Four catalogue categories are ingested today: **cars**, **motorcycles**, **scoot
 | Cross-encoder reranking | 🗺️ Planned | Not currently implemented |
 | Scheduled / incremental re-ingestion | ✅ Implemented | Kubernetes CronJob (daily 02:00 UTC by default), incremental runs, no overlapping runs; `--reset` only as a one-off Job |
 | Evaluation harness (retrieval and answer quality) | 🗺️ Planned | `tests/evaluation.py` is a 2-case smoke script, not a harness |
-| CI/CD | 🚧 In Progress | CI: offline tests, Helm lint/render, image build + push to GHCR on `main`. CD (`helm upgrade` to a cluster) is still manual |
+| CI/CD | ✅ Implemented | CI: offline tests, Helm lint/render, image build + push to GHCR on `main` with semantic versioning. CD (`helm upgrade` to a cluster) is still manual |
 
 ---
 
