@@ -226,14 +226,19 @@ tata-automotive-rag/
 python -m ingestion.pipeline [--categories cars motorcycles ...] [--reset]
 ```
 
-For each selected category (`ingestion/pipeline.py::run_ingestion`):
+Every pipeline run executes the same stages for **all four categories**, assigning one global version to all rows written:
 
 1. **Load** — `LOADERS[category]().download_and_extract()` runs one Playwright browser lifecycle, discovers product pages, extracts each one, downloads its images, and captions them via Ollama vision where the loader has vision enabled.
 2. **Normalize** — `normalize_document(raw, category, image_store)` maps every loader's dialect onto one `NormalizedDocument` (see [Canonical Document Model](#canonical-document-model)). Images are persisted to durable, category-scoped storage; a bad image is dropped and logged, never fails the document.
 3. **Embed if missing** — `_embed_missing` only calls Ollama for text/images the loader didn't already embed, off the event loop via `asyncio.to_thread`.
 4. **Upsert** — `MetadataStore.upsert_documents` writes one `brochure_chunks` row and its `brochure_images` rows per document, in its own savepoint so one bad document doesn't fail the run.
 
-`--reset` truncates `brochure_images`/`brochure_chunks` first. Re-running without `--reset` **replaces** each product's row (document id is derived deterministically from its product URL or brand+model, not a random UUID), so repeat runs don't duplicate products.
+**Versioning strategy:** `--reset` truncates both tables and starts a new major version (e.g., v5.0 → v6.0). Regular runs without `--reset` increment the minor version (e.g., v5.0 → v5.1) and cover all four categories in one atomic version bump. This ensures:
+- All categories in a version are from the same run, so data is consistent (no mixing old motorcycles with new cars).
+- Retrieval prefers the latest version; if a category is missing from the newest version, retrieval automatically falls back to the previous version.
+- Re-running without `--reset` **replaces** each product's row (document id is deterministic), so repeat runs never duplicate products.
+
+Partial category ingestion (e.g., `--categories cars`) **is not supported** because it would leave other categories at a stale version, breaking retrieval. If you need to update only one category for testing, use `--reset` to start fresh instead.
 
 ---
 
@@ -437,10 +442,11 @@ The database schema is created automatically on first run — no manual `psql`/s
 
 ```bash
 cd src
-python -m ingestion.pipeline                              # all four categories
-python -m ingestion.pipeline --categories cars             # one category
-python -m ingestion.pipeline --reset                       # wipe and rebuild everything
+python -m ingestion.pipeline                              # all four categories, one global version
+python -m ingestion.pipeline --reset                       # wipe and rebuild everything with new major version
 ```
+
+**Important versioning rule:** Each pipeline run assigns **one version to all categories**. Partial ingestion (e.g., `--categories cars`) is ignored; all categories are always ingested together. This keeps retrieval simple (search one version) and prevents data inconsistency (stale motorcycles + new cars in different versions).
 
 ### Run the UI (online)
 

@@ -38,7 +38,7 @@ def _parse_product(row: asyncpg.Record) -> ProductItem:
         price=meta.get("price"),
         vehicle_type=str(vtype) if vtype else None,
         product_url=meta.get("product_url") or meta.get("source_url"),
-        text=text_preview if not name else None,
+        text=text_preview,
     )
 
 

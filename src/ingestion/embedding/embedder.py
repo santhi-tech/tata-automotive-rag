@@ -20,11 +20,15 @@ DEFAULT_VISION_PROMPT = (
 
 
 def _jpeg_base64(image_path: str) -> str:
-    """Re-encode as JPEG. CDNs serve AVIF/WebP under .jpg URLs, and Ollama's decoder rejects them (HTTP 400)."""
-    with Image.open(image_path) as image:
-        buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, "JPEG", quality=90)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    """Re-encode as JPEG. CDNs serve AVIF/WebP under .jpg URLs, and Ollama's decoder rejects them (HTTP 400).
+    Raises ValueError if the file is not a valid image."""
+    try:
+        with Image.open(image_path) as image:
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, "JPEG", quality=90)
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except (OSError, ValueError) as e:
+        raise ValueError(f"Invalid or corrupted image file: {image_path}") from e
 
 
 class Embedder:

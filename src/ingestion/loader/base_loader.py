@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urldefrag, urlparse
 
 import aiohttp
+from PIL import Image
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from config.logger import setup_logger
@@ -183,6 +184,16 @@ class BaseLoader:
                 break
 
     # -- images ---------------------------------------------------------------
+    def _is_valid_image(self, filepath: str) -> bool:
+        """Check if a file is a valid image that Ollama can process."""
+        try:
+            with Image.open(filepath) as img:
+                # Verify it's a real image by accessing a property
+                _ = img.size
+                return True
+        except (OSError, ValueError):
+            return False
+
     async def download_image(
         self, session: aiohttp.ClientSession, image_url: str, directory: str, max_bytes: Optional[int] = None
     ) -> Optional[str]:
@@ -208,6 +219,10 @@ class BaseLoader:
                             logger.warning("Image exceeded max size while streaming | url=%s", image_url)
                             return None
                         file.write(chunk)
+            if not self._is_valid_image(filepath):
+                logger.warning("Downloaded file is not a valid image; file may be corrupted or HTML error page | url=%s", image_url)
+                os.remove(filepath)
+                return None
             return str(self.image_store.persist(filepath, image_url))
         except Exception:
             logger.exception("Image download failed | %s", image_url)

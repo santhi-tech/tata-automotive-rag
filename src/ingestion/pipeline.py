@@ -3,7 +3,6 @@ Here chunking = one product → one chunk.
 Here loader already produced embeddings for images, they are preserved. 
 Usage (from ``src/``):
     python -m ingestion.pipeline                      # all categories
-    python -m ingestion.pipeline --categories motorcycles scooters
     python -m ingestion.pipeline --reset              # rebuild from scratch
 """
 from __future__ import annotations
@@ -45,13 +44,19 @@ async def run_ingestion(categories: list[str] | None = None, *, reset: bool = Fa
     embedder = Embedder()
     store = MetadataStore()
     await store.init_db()
+
+    # STRUCTURAL FIX: always ingest all categories to keep versions in sync
+    # --categories is for logging/documentation only; partial ingestion breaks versioning
+    if categories:
+        logger.warning("[Ingestion] --categories specified but IGNORED; all categories will be ingested to maintain version sync")
+
     try:
         if reset:
             version = await store.reset()
         else:
             version = await store.next_metadata_version()
-        logger.info("[Ingestion] metadata_version=%s", version)
-        for category in categories or LOADERS:
+        logger.info("[Ingestion] metadata_version=%s (all categories in this version)", version)
+        for category in LOADERS:  # Always all categories
             logger.info("[Ingestion] category=%s run=%s", category, run_id)
             raw_docs = await LOADERS[category]().download_and_extract()
             if not raw_docs:
